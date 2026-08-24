@@ -48,7 +48,7 @@ def test_compiler_accepts_a_minimal_hypothesis_protocol(panel: Panel) -> None:
 
     weights = _weights(hypothesis, panel)
 
-    assert weights.where(panel.universe_mask()).notna().all().all()
+    assert weights.notna().eq(panel.universe_mask()).all().all()
 
 
 @pytest.mark.parametrize(

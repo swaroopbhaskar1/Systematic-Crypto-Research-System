@@ -151,8 +151,14 @@ def test_pct_change_uses_the_requested_trailing_period(panel: Panel) -> None:
     ("source", "expected_factory"),
     [
         ("abs(funding_8h)", lambda p: p.field("funding_8h").abs()),
-        ("sign(funding_8h)", lambda p: np.sign(p.field("funding_8h"))),
-        ("log(quote_volume)", lambda p: np.log(p.field("quote_volume"))),
+        (
+            "sign(funding_8h)",
+            lambda p: np.sign(p.field("funding_8h").astype(float)),
+        ),
+        (
+            "log(quote_volume)",
+            lambda p: np.log(p.field("quote_volume").astype(float)),
+        ),
         (
             "clip(funding_8h, -0.0003, 0.0003)",
             lambda p: p.field("funding_8h").clip(-0.0003, 0.0003),
