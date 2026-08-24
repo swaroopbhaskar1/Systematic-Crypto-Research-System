@@ -168,4 +168,5 @@ def _xs_z(source: pd.DataFrame, panel: Panel) -> pd.DataFrame:
     eligible = _numeric_frame(source).where(universe)
     mean = eligible.mean(axis=1)
     standard_deviation = eligible.std(axis=1, ddof=0)
-    return eligible.sub(mean, axis=0).div(standard_deviation, axis=0).where(universe)
+    result = eligible.sub(mean, axis=0).div(standard_deviation, axis=0)
+    return result.astype(object).where(universe)
