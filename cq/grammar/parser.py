@@ -98,7 +98,7 @@ class _Parser:
         if self._current.kind is _TokenKind.END:
             raise GrammarError("expression cannot be empty")
         expression = self._parse_or()
-        if self._current.kind is not _TokenKind.END:
+        if self._current.text:
             raise GrammarError(f"unexpected token {self._current.text!r}")
         if expression.kind is ValueKind.NUMBER:
             raise GrammarError("expression must reference market data")
@@ -353,7 +353,7 @@ def _literal_value(expression: Expression) -> tuple[float, bool]:
     raise GrammarError("argument must be a numeric literal")
 
 
-def parse_expression(source: str) -> Expression:
+def parse_expression(source: object) -> Expression:
     """Parse one expression without executing Python or reading market data."""
 
     if not isinstance(source, str):

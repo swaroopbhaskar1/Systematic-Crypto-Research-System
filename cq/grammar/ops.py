@@ -4,6 +4,7 @@ from typing import TypeAlias, assert_never, cast
 
 import numpy as np
 import pandas as pd
+from pandas.core.window.rolling import Rolling
 
 from cq.data.panel import Panel
 from cq.grammar.ast import (
@@ -133,7 +134,7 @@ def _rolling(
     source: pd.DataFrame,
     expression: Call,
     panel: Panel,
-) -> pd.core.window.rolling.Rolling:
+) -> Rolling:
     window = _integer_argument(expression, panel, 1)
     return source.rolling(window=window, min_periods=window, center=False)
 

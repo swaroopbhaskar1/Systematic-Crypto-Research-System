@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol, assert_never, runtime_checkable
+from typing import Protocol, assert_never, cast, runtime_checkable
 
 import pandas as pd
 
@@ -20,10 +20,10 @@ class _Direction(Enum):
 
 @runtime_checkable
 class _Hypothesis(Protocol):
-    entry_rule: str
-    exit_rule: str
-    data_required: tuple[str, ...]
-    mode: str
+    entry_rule: object
+    exit_rule: object
+    data_required: object
+    mode: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +74,7 @@ def _target_weights(
 
 
 def _normalize(selected: pd.DataFrame, total: float) -> pd.DataFrame:
-    counts = selected.sum(axis=1).astype(float)
+    counts = cast(pd.Series[float], selected.sum(axis=1).astype(float))
     weights = selected.astype(float).div(counts.where(counts > 0), axis=0)
     return weights.mul(total).fillna(0.0)
 
@@ -102,6 +102,8 @@ def _validated_hypothesis(
     if not isinstance(hypothesis.exit_rule, str):
         raise GrammarError("exit_rule must be a string")
     data_required = _validated_data_required(hypothesis.data_required)
+    if not isinstance(hypothesis.mode, str):
+        raise GrammarError("mode must be a string")
     try:
         direction = _Direction(hypothesis.mode)
     except (TypeError, ValueError) as error:
@@ -110,16 +112,18 @@ def _validated_hypothesis(
 
 
 def _validated_data_required(value: object) -> tuple[str, ...]:
-    if not isinstance(value, tuple) or not all(
-        isinstance(column, str) for column in value
-    ):
+    if not isinstance(value, tuple):
         raise GrammarError("data_required must be a tuple of column names")
-    columns = tuple(value)
+    columns: list[str] = []
+    for column in value:
+        if not isinstance(column, str):
+            raise GrammarError("data_required must contain only column names")
+        columns.append(column)
     if len(columns) != len(set(columns)):
         raise GrammarError("data_required columns must be unique")
     if not set(columns).issubset(ALLOWED_COLUMNS):
         raise GrammarError("data_required contains an unknown column")
-    return columns
+    return tuple(columns)
 
 
 def compile_signal(hypothesis: object) -> CompiledSignal:
