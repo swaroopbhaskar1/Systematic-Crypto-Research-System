@@ -1,0 +1,25 @@
+Forced-flow research hypotheses only. Return a JSON array of objects that
+match the Hypothesis schema. Do not write prose.
+
+Start from who is forced to trade regardless of price. Mechanism classes:
+carry, mean_reversion, momentum, event.
+
+Allowed columns:
+open, high, low, close, volume, quote_volume, funding_8h, open_interest
+
+Allowed functions:
+lag(x, n) with n >= 1
+roll_mean(x, w), roll_std(x, w), roll_z(x, w), roll_pct(x, w, q)
+roll_min(x, w), roll_max(x, w), pct_change(x, n)
+xs_rank(x), xs_z(x), abs(x), sign(x), log(x), clip(x, lo, hi)
+
+There is no lead, future_, negative lag, or center=True rolling.
+
+Each object must include:
+id, mechanism_class, forced_participant (>=20 chars), why_forced (>=40 chars),
+universe_filter, entry_rule, exit_rule, direction, holding_bars,
+testable_prediction, expected_capacity_usd, competition_risk, data_required.
+
+direction is long_only, market_neutral, or short_only.
+data_required must exactly equal the columns referenced by the rules.
+open_interest is currently untestable historically; do not require it.

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from cq.data.panel import Panel
@@ -185,3 +186,14 @@ def assert_aligned(result: pd.DataFrame, panel: Panel) -> None:
     assert result.columns.equals(expected.columns)
     assert result.columns.name == "symbol"
     assert result.shape == expected.shape
+
+
+def finite_cells(frame: pd.DataFrame) -> np.ndarray:
+    """Return finite numeric cells, ignoring unavailable NaN entries."""
+    values = frame.to_numpy(dtype=float)
+    return values[np.isfinite(values)]
+
+
+def has_finite_cells(frame: pd.DataFrame) -> bool:
+    """Return whether any cell is a finite number."""
+    return bool(np.isfinite(frame.to_numpy(dtype=float)).any())

@@ -9,6 +9,7 @@ from fixtures.grammar import (
     DAY_MS,
     HISTORY_PERIODS,
     assert_aligned,
+    has_finite_cells,
     make_grammar_panel,
 )
 
@@ -186,7 +187,7 @@ def test_xs_rank_uses_only_same_timestamp_eligible_symbols(panel: Panel) -> None
 
     pd.testing.assert_frame_equal(actual, expected)
     unavailable = ~panel.universe_mask()
-    assert actual.where(unavailable).stack().empty
+    assert not has_finite_cells(actual.where(unavailable))
 
 
 def test_xs_z_uses_only_same_timestamp_eligible_symbols(panel: Panel) -> None:
@@ -200,7 +201,7 @@ def test_xs_z_uses_only_same_timestamp_eligible_symbols(panel: Panel) -> None:
 
     pd.testing.assert_frame_equal(actual, expected)
     unavailable = ~panel.universe_mask()
-    assert actual.where(unavailable).stack().empty
+    assert not has_finite_cells(actual.where(unavailable))
 
 
 @pytest.mark.parametrize(

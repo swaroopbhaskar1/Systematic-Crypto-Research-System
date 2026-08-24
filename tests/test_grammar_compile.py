@@ -15,6 +15,8 @@ from fixtures.grammar import (
     SAMPLE_HYPOTHESES,
     GrammarHypothesis,
     assert_aligned,
+    finite_cells,
+    has_finite_cells,
     make_grammar_panel,
 )
 
@@ -82,9 +84,9 @@ def test_directional_rows_are_normalized_when_any_symbol_is_selected(
         atol=1e-12,
     )
     if mode == "long_only":
-        assert (available.stack() >= 0.0).all()
+        assert (finite_cells(available) >= 0.0).all()
     else:
-        assert (available.stack() <= 0.0).all()
+        assert (finite_cells(available) <= 0.0).all()
 
 
 def test_market_neutral_rows_have_zero_net_and_both_sides(panel: Panel) -> None:
@@ -122,7 +124,7 @@ def test_unavailable_symbols_are_nan_not_zero(panel: Panel, mode: str) -> None:
     unavailable = ~panel.universe_mask()
 
     assert unavailable.any().any()
-    assert weights.where(unavailable).stack().empty
+    assert not has_finite_cells(weights.where(unavailable))
     assert (weights.notna() | unavailable).all().all()
 
 
@@ -136,7 +138,7 @@ def test_exit_rule_vetoes_an_entry_on_the_same_row(panel: Panel) -> None:
     weights = _weights(hypothesis, panel)
     available = weights.where(panel.universe_mask())
 
-    assert (available.stack() == 0.0).all()
+    assert (finite_cells(available) == 0.0).all()
 
 
 def test_signal_emits_current_row_weights_without_an_execution_shift(
@@ -339,7 +341,7 @@ def test_twenty_representative_hypotheses_compile_and_run(
     active_rows = available.abs().sum(axis=1) > 0
 
     assert len(SAMPLE_HYPOTHESES) == 20
-    assert np.isfinite(available.stack().to_numpy()).all()
+    assert np.isfinite(finite_cells(available)).all()
     if hypothesis.mode == "long_only":
         np.testing.assert_allclose(
             available.loc[active_rows].sum(axis=1),

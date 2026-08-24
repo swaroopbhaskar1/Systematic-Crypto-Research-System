@@ -1,0 +1,15 @@
+{
+  "id": "funding_extreme_001",
+  "mechanism_class": "carry",
+  "forced_participant": "perpetual longs paying funding at the 95th percentile of trailing distribution",
+  "why_forced": "Holders of leveraged perpetual positions must pay funding every 8h regardless of price view; exiting requires crossing the spread, so crowded positioning persists longer than the funding cost justifies.",
+  "universe_filter": "top 100 by 30d median quote volume, excluding stablecoins",
+  "entry_rule": "funding_8h > roll_pct(funding_8h, 270, 0.95)",
+  "exit_rule": "funding_8h < roll_pct(funding_8h, 270, 0.50)",
+  "direction": "market_neutral",
+  "holding_bars": 9,
+  "testable_prediction": "mean forward 3d return of the paid side exceeds costs, t-stat > 2 in walk-forward",
+  "expected_capacity_usd": 50000,
+  "competition_risk": "medium",
+  "data_required": ["funding_8h"]
+}

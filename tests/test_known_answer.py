@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 import pytest
 from cq.backtest.costs import CostModel
@@ -7,9 +8,13 @@ from cq.backtest.engine import run_backtest
 
 from cq.data.panel import Panel
 
-BAR_TIMESTAMPS = pd.date_range(
-    "2024-01-01", periods=10, freq="D", tz="UTC"
-).asi8 // 1_000_000
+BAR_TIMESTAMPS = np.array(
+    [
+        int(stamp.value // 1_000_000)
+        for stamp in pd.date_range("2024-01-01", periods=10, freq="D", tz="UTC")
+    ],
+    dtype=np.int64,
+)
 SYMBOLS = ("AAAUSDT", "BBBUSDT")
 
 

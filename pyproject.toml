@@ -27,6 +27,9 @@ cq-archive-gate = "cq.data.gate:main"
 [tool.setuptools.packages.find]
 include = ["cq*"]
 
+[tool.setuptools.package-data]
+cq = ["ai/prompts/*.txt"]
+
 [tool.pytest.ini_options]
 addopts = [
     "--strict-config",

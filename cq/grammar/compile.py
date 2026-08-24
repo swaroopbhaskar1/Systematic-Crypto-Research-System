@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol, assert_never, cast, runtime_checkable
+from typing import Protocol, Sequence, assert_never, cast, runtime_checkable
 
 import pandas as pd
 
@@ -26,7 +26,6 @@ class _Hypothesis(Protocol):
     entry_rule: object
     exit_rule: object
     data_required: object
-    mode: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,20 +104,27 @@ def _validated_hypothesis(
     if not isinstance(hypothesis.exit_rule, str):
         raise GrammarError("exit_rule must be a string")
     data_required = _validated_data_required(hypothesis.data_required)
-    if not isinstance(hypothesis.mode, str):
-        raise GrammarError("mode must be a string")
-    try:
-        direction = _Direction(hypothesis.mode)
-    except (TypeError, ValueError) as error:
-        raise GrammarError("mode is not a supported direction") from error
+    direction = _direction_of(hypothesis)
     return hypothesis.entry_rule, hypothesis.exit_rule, data_required, direction
 
 
+def _direction_of(hypothesis: object) -> _Direction:
+    raw = getattr(hypothesis, "direction", None)
+    if not isinstance(raw, str):
+        raw = getattr(hypothesis, "mode", None)
+    if not isinstance(raw, str):
+        raise GrammarError("direction must be a string")
+    try:
+        return _Direction(raw)
+    except ValueError as error:
+        raise GrammarError("direction is not a supported value") from error
+
+
 def _validated_data_required(value: object) -> tuple[str, ...]:
-    if not isinstance(value, tuple):
-        raise GrammarError("data_required must be a tuple of column names")
+    if not isinstance(value, (tuple, list)):
+        raise GrammarError("data_required must be a sequence of column names")
     columns: list[str] = []
-    for column in cast(tuple[object, ...], value):
+    for column in cast(Sequence[object], value):
         if not isinstance(column, str):
             raise GrammarError("data_required must contain only column names")
         columns.append(column)
