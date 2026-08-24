@@ -139,11 +139,13 @@ class FakeArchive:
         month: int,
         *,
         base: float = 100.0,
+        days: Sequence[date] | None = None,
     ) -> str:
         key = monthly_kline_archive_key(
             market_type, symbol, timeframe, date(year, month, 1)
         )
-        self.add(key, kline_zip(month_days(year, month), base=base))
+        published = days if days is not None else month_days(year, month)
+        self.add(key, kline_zip(published, base=base))
         return key
 
     def add_daily_klines(
@@ -416,6 +418,140 @@ def test_delist_reason_is_only_asserted_where_the_archive_substantiates_it(
     assert by_symbol["LIVEUSDT"].delisted_at is None
     assert by_symbol["LIVEUSDT"].delist_reason is None
     assert by_symbol["LATEUSDT"].listed_at == datetime(2024, 2, 1, tzinfo=UTC)
+
+
+def test_monthly_archive_that_starts_mid_month_lists_at_first_bar_not_month_start(
+    tmp_path: Path,
+) -> None:
+    """Key-span month starts are wider than published bars; membership must not claim them."""
+    archive, client = spot_archive(tmp_path)
+    published = days_between(date(2024, 1, 15), date(2024, 1, 31))
+    archive.add_monthly_klines("spot", "LATEUSDT", "1d", 2024, 1, days=published)
+
+    with client:
+        listings = ingest_store.archive_listings(
+            "spot", end=date(2024, 2, 1), client=client
+        )
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    listing = listings[0]
+    registry = UniverseRegistry(listings)
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+
+    assert listing.listed_at == datetime(2024, 1, 15, tzinfo=UTC)
+    assert listing.delisted_at is None
+    assert "LATEUSDT" not in registry.universe_at(
+        datetime(2024, 1, 14, tzinfo=UTC), "spot"
+    )
+    assert "LATEUSDT" in registry.universe_at(datetime(2024, 1, 15, tzinfo=UTC), "spot")
+    assert summary.failures == ()
+    assert summary.bars_written == len(published)
+    assert int(frame["ts"].min()) == day_ms(date(2024, 1, 15))
+    assert date(2024, 1, 1) not in {
+        datetime.fromtimestamp(int(value) / 1000, tz=UTC).date()
+        for value in frame["ts"]
+    }
+    validate_frame(frame, listings=listings, timeframe="1d")
+
+
+def test_monthly_archive_that_ends_mid_month_delists_the_day_after_last_bar(
+    tmp_path: Path,
+) -> None:
+    """A last monthly key covering the calendar month must not invent post-halt days."""
+    archive, client = spot_archive(tmp_path)
+    last_days = days_between(date(2024, 2, 1), date(2024, 2, 11))
+    archive.add_monthly_klines("spot", "DEADUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("spot", "DEADUSDT", "1d", 2024, 2, days=last_days)
+
+    with client:
+        listings = ingest_store.archive_listings(
+            "spot", end=date(2024, 4, 1), client=client
+        )
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 4, 1),
+            client=client,
+            asof=day_ms(date(2024, 4, 1)),
+        )
+
+    listing = listings[0]
+    registry = UniverseRegistry(listings)
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 4, 1))
+    )
+
+    assert listing.delisted_at == datetime(2024, 2, 12, tzinfo=UTC)
+    assert listing.delist_reason == "delisted"
+    assert "DEADUSDT" in registry.universe_at(datetime(2024, 2, 11, tzinfo=UTC), "spot")
+    assert "DEADUSDT" not in registry.universe_at(
+        datetime(2024, 2, 12, tzinfo=UTC), "spot"
+    )
+    assert summary.failures == ()
+    assert summary.bars_written == 31 + len(last_days)
+    assert int(frame["ts"].max()) == day_ms(date(2024, 2, 11))
+    validate_frame(frame, listings=listings, timeframe="1d")
+
+
+def test_trailing_daily_before_ingest_end_is_still_a_live_listing(
+    tmp_path: Path,
+) -> None:
+    """Last actual bar can precede ingest end without being a delisting."""
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "LIVEUSDT", "1d", 2024, 1)
+    for day in days_between(date(2024, 2, 1), date(2024, 2, 10)):
+        archive.add_daily_klines("spot", "LIVEUSDT", "1d", day)
+
+    with client:
+        listings = ingest_store.archive_listings(
+            "spot", end=date(2024, 2, 15), client=client
+        )
+
+    assert listings[0].listed_at == datetime(2024, 1, 1, tzinfo=UTC)
+    assert listings[0].delisted_at is None
+
+
+def test_mid_month_listing_bounds_still_drop_an_interior_hole(tmp_path: Path) -> None:
+    """Tightening bounds must not excuse a hole between the first and last published bar."""
+    archive, client = spot_archive(tmp_path)
+    published = [
+        day
+        for day in days_between(date(2024, 1, 15), date(2024, 1, 31))
+        if day != date(2024, 1, 20)
+    ]
+    archive.add_monthly_klines("spot", "HOLEUSDT", "1d", 2024, 1, days=published)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+
+    assert summary.bars_written == 0
+    assert frame.empty
+    assert [failure.symbol for failure in summary.failures] == ["HOLEUSDT"]
+    assert "gap" in summary.failures[0].reason
 
 
 def test_listing_bounds_override_a_fully_priced_bar() -> None:
@@ -1752,6 +1888,59 @@ def test_resume_skips_a_symbol_already_fully_present_for_the_requested_range(
     assert len(archive.downloads) == downloads_after_first
     assert not frame.duplicated(["ts", "symbol", "market_type"]).any()
     assert len(frame) == 62
+
+
+def test_resume_skips_a_symbol_whose_first_archive_started_mid_month(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Skip expected timestamps must use published bars, not the monthly key's month start."""
+    archive, client = spot_archive(tmp_path)
+    published = days_between(date(2024, 1, 15), date(2024, 1, 31))
+    archive.add_monthly_klines("spot", "LATEUSDT", "1d", 2024, 1, days=published)
+    store_root = tmp_path / "store"
+    fetches: list[str] = []
+    original_frame = ingest_store._symbol_frame
+
+    def fetch(
+        client: BinanceArchiveClient,
+        coverage: SymbolCoverage,
+        **kwargs: object,
+    ) -> pd.DataFrame:
+        fetches.append(coverage.symbol)
+        return original_frame(client, coverage, **kwargs)
+
+    monkeypatch.setattr(ingest_store, "_symbol_frame", fetch)
+
+    with client:
+        first = ingest_to_store(
+            store_root,
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+        fetches.clear()
+        second = ingest_to_store(
+            store_root,
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 2)),
+        )
+
+    frame = ParquetStore(store_root).read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 2))
+    )
+
+    assert first.bars_written == len(published)
+    assert second.bars_written == 0
+    assert fetches == []
+    assert int(frame["ts"].min()) == day_ms(date(2024, 1, 15))
+    assert len(frame) == len(published)
 
 
 def test_resume_re_fetches_a_symbol_whose_stored_range_is_shorter_than_requested(

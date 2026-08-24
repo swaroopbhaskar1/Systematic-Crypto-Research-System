@@ -49,11 +49,14 @@ import pandas as pd
 
 from cq.data.ingest import (
     TIMEFRAME_MS,
+    ArchivePeriod,
     BinanceArchiveClient,
     fetch_ohlcv_archives,
     funding_prefix,
     kline_prefix,
+    raw_cache_key,
     read_funding_archive,
+    read_kline_archive,
 )
 from cq.data.store import REQUIRED_COLUMNS, ParquetStore
 from cq.data.universe import Listing, MarketType, UniverseRegistry
@@ -133,11 +136,18 @@ def list_symbol_coverage(
     )
     if not spans:
         return SymbolCoverage(symbol, frozenset(keys), None, None, last_funding_day)
+    first_day, last_day = _published_bar_days(
+        client,
+        market_type=market_type,
+        symbol=symbol,
+        timeframe=timeframe,
+        keys=keys,
+    )
     return SymbolCoverage(
         symbol,
         frozenset(keys),
-        min(span[0] for span in spans),
-        max(span[1] for span in spans),
+        first_day,
+        last_day,
         last_funding_day,
     )
 
@@ -151,12 +161,17 @@ def coverage_listing(
 ) -> Listing:
     """Turn archive coverage into a point-in-time listing record.
 
-    ``listed_at`` is the first day covered by the symbol's earliest archive.
-    ``delisted_at`` is the first day of the month *after* the symbol's last
-    archive, because the monthly archive is the unit in which the venue stops
-    publishing; dating the exit at month granularity can only ever extend a
-    listing, never truncate real history, and membership additionally requires
-    a real bar so the extension grants nothing.
+    ``listed_at`` is the first day that actually appears inside the symbol's
+    earliest archive, not the calendar month start of that object's key.
+    A monthly ZIP whose bars begin on the 15th listed on the 15th; claiming
+    the 1st would make gap validation demand days the venue never published.
+
+    ``delisted_at`` is the day after the last published bar when publication
+    has stopped relative to ``end``.  The live/dead decision still uses the
+    month after the last bar, because a trailing daily in the current month
+    is an open listing, not an exit.  Once that month-start test says the
+    symbol is dead, the exit is the next interval after the last bar, never
+    the rest of the calendar month.
 
     The only reason this can substantiate is ``"delisted"`` — the archive
     proves publication stopped, and nothing more.  ``"zero"`` needs a terminal
@@ -167,8 +182,7 @@ def coverage_listing(
     if coverage.first_day is None or coverage.last_day is None:
         raise ValueError(f"no archive coverage for {coverage.symbol}")
     listed_at = _midnight(coverage.first_day)
-    stopped_at = _midnight(_next_month_start(coverage.last_day))
-    if stopped_at >= _midnight(end):
+    if _midnight(_next_month_start(coverage.last_day)) >= _midnight(end):
         return Listing(
             symbol=coverage.symbol,
             exchange=exchange,
@@ -180,7 +194,7 @@ def coverage_listing(
         exchange=exchange,
         market_type=market_type,
         listed_at=listed_at,
-        delisted_at=stopped_at,
+        delisted_at=_midnight(coverage.last_day + timedelta(days=1)),
         delist_reason="delisted",
     )
 
@@ -813,6 +827,71 @@ def _archive_span(key: str) -> tuple[date, date] | None:
         return None
     year, month = int(monthly.group(1)), int(monthly.group(2))
     return date(year, month, 1), date(year, month, monthrange(year, month)[1])
+
+
+def _published_bar_days(
+    client: BinanceArchiveClient,
+    *,
+    market_type: MarketType,
+    symbol: str,
+    timeframe: str,
+    keys: Iterable[str],
+) -> tuple[date, date]:
+    """Read the earliest and latest kline archives to date actual bars."""
+    dated = [
+        (key, span) for key in keys if (span := _archive_span(key)) is not None
+    ]
+    first_key = min(dated, key=lambda item: (item[1][0], item[0]))[0]
+    last_key = max(dated, key=lambda item: (item[1][1], item[0]))[0]
+    first_bars = _read_coverage_klines(
+        client, first_key, market_type, symbol, timeframe
+    )
+    last_bars = (
+        first_bars
+        if first_key == last_key
+        else _read_coverage_klines(client, last_key, market_type, symbol, timeframe)
+    )
+    if first_bars.empty or last_bars.empty:
+        raise ValueError(f"bounding archive for {symbol} contains no bars")
+    first_day = datetime.fromtimestamp(
+        int(first_bars["ts"].min()) / 1000, tz=UTC
+    ).date()
+    last_day = datetime.fromtimestamp(int(last_bars["ts"].max()) / 1000, tz=UTC).date()
+    return first_day, last_day
+
+
+def _read_coverage_klines(
+    client: BinanceArchiveClient,
+    key: str,
+    market_type: MarketType,
+    symbol: str,
+    timeframe: str,
+) -> pd.DataFrame:
+    period, archive_date = _key_period_and_date(key)
+    payload = client.download(
+        key,
+        cache_key=raw_cache_key(
+            DEFAULT_EXCHANGE,
+            market_type,
+            symbol,
+            timeframe,
+            archive_date,
+            period=period,
+        ),
+    )
+    return read_kline_archive(payload)
+
+
+def _key_period_and_date(key: str) -> tuple[ArchivePeriod, date]:
+    daily = _DAILY_TOKEN.search(key)
+    if daily is not None:
+        return "daily", date(
+            int(daily.group(1)), int(daily.group(2)), int(daily.group(3))
+        )
+    monthly = _MONTHLY_TOKEN.search(key)
+    if monthly is None:
+        raise ValueError(f"unsupported archive key: {key}")
+    return "monthly", date(int(monthly.group(1)), int(monthly.group(2)), 1)
 
 
 def _last_funding_day(client: BinanceArchiveClient, symbol: str) -> date | None:
