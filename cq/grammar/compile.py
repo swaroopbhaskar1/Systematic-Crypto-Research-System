@@ -1,6 +1,8 @@
 # pyright: reportUnknownMemberType=false
 """Compile hypothesis-shaped objects into deterministic target-weight signals."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, assert_never, cast, runtime_checkable
