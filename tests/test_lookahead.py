@@ -244,6 +244,15 @@ def test_honest_engine_outputs_are_future_extension_invariant() -> None:
         pd.testing.assert_frame_equal(actual, expected, check_exact=True)
 
 
+def test_numeric_panel_timestamps_define_millisecond_data_span() -> None:
+    result = _run_backtest(
+        _panel_from_returns(np.zeros(14)),
+        ConstantWeightSignal(),
+    )
+
+    assert getattr(result, "data_span") == pd.Timedelta(days=13)
+
+
 def test_production_contains_exactly_one_canonical_execution_shift() -> None:
     sources = [
         path.read_text(encoding="utf-8")

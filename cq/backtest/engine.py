@@ -228,11 +228,7 @@ def _data_span(index: pd.Index) -> pd.Timedelta:
         nanoseconds = int(difference / np.timedelta64(1, "ns"))
         return pd.Timedelta(nanoseconds, unit="ns")
     numeric_difference = float(cast(float, difference))
-    first = float(cast(float, index[0]))
-    last = float(cast(float, index[-1]))
-    largest_endpoint = max(abs(first), abs(last))
-    unit = "s" if 1_000_000_000.0 <= largest_endpoint < 100_000_000_000.0 else "ms"
-    return pd.to_timedelta(numeric_difference, unit=unit)
+    return pd.to_timedelta(numeric_difference, unit="ms")
 
 
 def _config_hash(
