@@ -1,0 +1,11 @@
+Never weaken, delete, skip, or relax a test to make an implementation pass.
+Always write adversarial tests before implementation.
+Never hand-write research signals; signals must be generated through the grammar.
+Do not add an agent framework or machine learning.
+Never use a negative shift, a centered rolling window, or a negative lag.
+Never fill, forward-fill, backward-fill, or otherwise impute NaN price data.
+Never use `if paper` outside `cq/execution/`.
+Never implement live execution; it must remain an explicit NotImplementedError.
+Apply execution lag in exactly one location.
+Always report both gross and net performance.
+Always report the exact test count.

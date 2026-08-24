@@ -1,0 +1,2308 @@
+"""Adversarial tests for archive-driven ingestion into the Parquet store.
+
+Every test here is offline.  The Binance archive is served by an
+``httpx.MockTransport`` that answers S3 listings and object downloads from an
+in-memory key/value map, so a test that reaches the real network would fail
+rather than quietly succeed.
+"""
+
+import csv
+import io
+import json
+import zipfile
+from collections.abc import Mapping, Sequence
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+from urllib.parse import unquote
+
+import httpx
+import pandas as pd
+import pytest
+import scripts.ingest as ingest_cli
+
+from cq.data import ingest_store
+from cq.data.ingest import (
+    BINANCE_ARCHIVE_URL,
+    BINANCE_S3_URL,
+    BINANCE_SPOT_MARKET_DATA_URL,
+    BinanceArchiveClient,
+    fetch_ohlcv_archives,
+    kline_archive_key,
+    monthly_kline_archive_key,
+    plan_kline_archives,
+    raw_cache_key,
+)
+from cq.data.ingest_store import (
+    IngestSummary,
+    SymbolCoverage,
+    aggregate_funding,
+    build_archive_universe,
+    coverage_listing,
+    ingest_to_store,
+    resolve_symbols,
+    summary_json,
+)
+from cq.data.validate import validate_frame
+from cq.data.panel import Panel, add_execution_features
+from cq.data.store import REQUIRED_COLUMNS, ParquetStore
+from cq.data.universe import Listing, MarketType, UniverseRegistry
+
+DAY_MS = 86_400_000
+EIGHT_HOURS_MS = 28_800_000
+
+
+def day_ms(day: date) -> int:
+    return int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp() * 1000)
+
+
+def days_between(first: date, last: date) -> tuple[date, ...]:
+    count = (last - first).days + 1
+    return tuple(first + timedelta(days=offset) for offset in range(count))
+
+
+def month_days(year: int, month: int) -> tuple[date, ...]:
+    first = date(year, month, 1)
+    last = date(year + (month == 12), month % 12 + 1, 1) - timedelta(days=1)
+    return days_between(first, last)
+
+
+def _zipped(rows: Sequence[Sequence[str]], name: str) -> bytes:
+    text = io.StringIO()
+    csv.writer(text, lineterminator="\n").writerows(rows)
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr(name, text.getvalue())
+    return payload.getvalue()
+
+
+def kline_zip(days: Sequence[date], *, base: float = 100.0) -> bytes:
+    rows: list[list[str]] = []
+    for offset, day in enumerate(days):
+        opened = day_ms(day)
+        price = base + offset
+        rows.append(
+            [
+                str(opened),
+                str(price),
+                str(price + 1.0),
+                str(price - 1.0),
+                str(price + 0.5),
+                "10",
+                str(opened + DAY_MS - 1),
+                str(1_000.0 + offset),
+                "5",
+                "5",
+                "500",
+                "0",
+            ]
+        )
+    return _zipped(rows, "klines.csv")
+
+
+def funding_zip(prints: Mapping[int, float]) -> bytes:
+    rows: list[list[str]] = [
+        ["calc_time", "funding_interval_hours", "last_funding_rate"]
+    ]
+    rows.extend(
+        [str(timestamp), "8", repr(rate)] for timestamp, rate in sorted(prints.items())
+    )
+    return _zipped(rows, "funding.csv")
+
+
+def eight_hourly(day: date, rates: Sequence[float]) -> dict[int, float]:
+    opened = day_ms(day)
+    return {
+        opened + index * EIGHT_HOURS_MS: rate for index, rate in enumerate(rates)
+    }
+
+
+class FakeArchive:
+    """An in-memory Binance archive served over ``httpx.MockTransport``."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.requests: list[str] = []
+        self.downloads: list[str] = []
+        self.missing: set[str] = set()
+        self.malformed_listing_prefixes: set[str] = set()
+        self.trading_symbols: tuple[str, ...] = ()
+
+    def add(self, key: str, payload: bytes) -> None:
+        self.objects[key] = payload
+
+    def add_monthly_klines(
+        self,
+        market_type: MarketType,
+        symbol: str,
+        timeframe: str,
+        year: int,
+        month: int,
+        *,
+        base: float = 100.0,
+        days: Sequence[date] | None = None,
+    ) -> str:
+        key = monthly_kline_archive_key(
+            market_type, symbol, timeframe, date(year, month, 1)
+        )
+        published = days if days is not None else month_days(year, month)
+        self.add(key, kline_zip(published, base=base))
+        return key
+
+    def add_daily_klines(
+        self,
+        market_type: MarketType,
+        symbol: str,
+        timeframe: str,
+        day: date,
+        *,
+        base: float = 100.0,
+    ) -> str:
+        key = kline_archive_key(market_type, symbol, timeframe, day)
+        self.add(key, kline_zip((day,), base=base))
+        return key
+
+    def add_funding(self, symbol: str, month: date, prints: Mapping[int, float]) -> str:
+        key = (
+            f"data/futures/um/monthly/fundingRate/{symbol}/"
+            f"{symbol}-fundingRate-{month:%Y-%m}.zip"
+        )
+        self.add(key, funding_zip(prints))
+        return key
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self._handle)
+
+    def client(self, cache_root: Path) -> BinanceArchiveClient:
+        return BinanceArchiveClient(
+            transport=self.transport(),
+            cache_root=cache_root,
+            attempts=1,
+            initial_delay=0.0,
+            sleep=lambda _seconds: None,
+        )
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        self.requests.append(url)
+        if url.startswith(BINANCE_S3_URL):
+            return httpx.Response(200, content=self._listing(request))
+        if url.startswith(BINANCE_SPOT_MARKET_DATA_URL):
+            return httpx.Response(200, json=self._exchange_info())
+        if not url.startswith(f"{BINANCE_ARCHIVE_URL}/"):
+            raise AssertionError(f"unexpected network call: {url}")
+        key = unquote(url[len(BINANCE_ARCHIVE_URL) + 1 :])
+        self.downloads.append(key)
+        payload = self.objects.get(key)
+        if payload is None or key in self.missing:
+            return httpx.Response(404)
+        return httpx.Response(200, content=payload)
+
+    def _listing(self, request: httpx.Request) -> bytes:
+        prefix = request.url.params["prefix"]
+        delimiter = request.url.params.get("delimiter")
+        if prefix in self.malformed_listing_prefixes:
+            return b"<ListBucketResult><unclosed>"
+        matched = sorted(key for key in self.objects if key.startswith(prefix))
+        if delimiter is None:
+            body = "".join(
+                f"<Contents><Key>{key}</Key><Size>{len(self.objects[key])}</Size>"
+                "</Contents>"
+                for key in matched
+            )
+        else:
+            children = sorted(
+                {
+                    f"{prefix}{key[len(prefix) :].split('/', 1)[0]}/"
+                    for key in matched
+                    if "/" in key[len(prefix) :]
+                }
+            )
+            body = "".join(
+                f"<CommonPrefixes><Prefix>{child}</Prefix></CommonPrefixes>"
+                for child in children
+            )
+        return (
+            "<ListBucketResult><IsTruncated>false</IsTruncated>"
+            f"{body}</ListBucketResult>"
+        ).encode()
+
+    def _exchange_info(self) -> dict[str, object]:
+        return {
+            "symbols": [
+                {"symbol": symbol, "quoteAsset": "USDT", "status": "TRADING"}
+                for symbol in self.trading_symbols
+            ]
+        }
+
+
+def spot_archive(tmp_path: Path) -> tuple[FakeArchive, BinanceArchiveClient]:
+    archive = FakeArchive()
+    return archive, archive.client(tmp_path / "cache")
+
+
+# --------------------------------------------------------------------------
+# Monthly / daily archive planning and the seam between them
+# --------------------------------------------------------------------------
+
+
+def test_whole_months_use_monthly_archives_and_partial_edges_use_daily() -> None:
+    planned = plan_kline_archives(
+        "perp",
+        "BTCUSDT",
+        "1d",
+        day_ms(date(2024, 1, 30)),
+        day_ms(date(2024, 3, 3)),
+    )
+
+    keys = [item.key for item in planned]
+    periods = [item.period for item in planned]
+
+    assert keys[:2] == [
+        "data/futures/um/daily/klines/BTCUSDT/1d/BTCUSDT-1d-2024-01-30.zip",
+        "data/futures/um/daily/klines/BTCUSDT/1d/BTCUSDT-1d-2024-01-31.zip",
+    ]
+    assert keys[2] == (
+        "data/futures/um/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2024-02.zip"
+    )
+    assert keys[3:] == [
+        "data/futures/um/daily/klines/BTCUSDT/1d/BTCUSDT-1d-2024-03-01.zip",
+        "data/futures/um/daily/klines/BTCUSDT/1d/BTCUSDT-1d-2024-03-02.zip",
+    ]
+    assert periods == ["daily", "daily", "monthly", "daily", "daily"]
+
+
+def test_monthly_and_daily_seam_produces_no_duplicate_or_missing_bar(
+    tmp_path: Path,
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "BTCUSDT", "1d", 2024, 1)
+    for day in days_between(date(2024, 2, 1), date(2024, 2, 15)):
+        archive.add_daily_klines("spot", "BTCUSDT", "1d", day, base=200.0)
+
+    with client:
+        frame = fetch_ohlcv_archives(
+            "binance",
+            "BTCUSDT",
+            "1d",
+            day_ms(date(2024, 1, 1)),
+            day_ms(date(2024, 2, 16)),
+            "spot",
+            archive_client=client,
+        )
+
+    expected = [
+        day_ms(day) for day in days_between(date(2024, 1, 1), date(2024, 2, 15))
+    ]
+    assert frame["ts"].tolist() == expected
+    assert not frame["ts"].duplicated().any()
+    assert len(archive.downloads) == 16
+
+
+def test_monthly_archive_cache_key_never_collides_with_the_first_daily_key(
+    tmp_path: Path,
+) -> None:
+    monthly = raw_cache_key(
+        "binance", "spot", "BTCUSDT", "1d", date(2024, 1, 1), period="monthly"
+    )
+    daily = raw_cache_key("binance", "spot", "BTCUSDT", "1d", date(2024, 1, 1))
+
+    assert monthly != daily
+    assert "2024-01" in str(monthly)
+    assert "2024-01-01" in str(daily)
+
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "BTCUSDT", "1d", 2024, 1)
+    with client:
+        first = fetch_ohlcv_archives(
+            "binance",
+            "BTCUSDT",
+            "1d",
+            day_ms(date(2024, 1, 1)),
+            day_ms(date(2024, 2, 1)),
+            "spot",
+            archive_client=client,
+        )
+        second = fetch_ohlcv_archives(
+            "binance",
+            "BTCUSDT",
+            "1d",
+            day_ms(date(2024, 1, 1)),
+            day_ms(date(2024, 2, 1)),
+            "spot",
+            archive_client=client,
+        )
+
+    pd.testing.assert_frame_equal(first, second)
+    assert len(archive.downloads) == 1
+
+
+# --------------------------------------------------------------------------
+# Survivorship: the universe is built from archive listings
+# --------------------------------------------------------------------------
+
+
+def _three_symbol_archive(tmp_path: Path) -> tuple[FakeArchive, BinanceArchiveClient]:
+    archive, client = spot_archive(tmp_path)
+    for month in (1, 2, 3):
+        archive.add_monthly_klines("spot", "LIVEUSDT", "1d", 2024, month)
+    for month in (1, 2):
+        archive.add_monthly_klines("spot", "DEADUSDT", "1d", 2024, month)
+    for month in (2, 3):
+        archive.add_monthly_klines("spot", "LATEUSDT", "1d", 2024, month)
+    archive.trading_symbols = ("LIVEUSDT", "LATEUSDT")
+    return archive, client
+
+
+def test_universe_comes_from_archive_listings_not_live_trading_symbols(
+    tmp_path: Path,
+) -> None:
+    archive, client = _three_symbol_archive(tmp_path)
+
+    with client:
+        registry = build_archive_universe("spot", end=date(2024, 4, 1), client=client)
+
+    members = registry.universe_at(datetime(2024, 1, 15, tzinfo=UTC), "spot")
+
+    assert "DEADUSDT" in members
+    assert "DEADUSDT" not in archive.trading_symbols
+    assert not any(
+        url.startswith(BINANCE_SPOT_MARKET_DATA_URL) for url in archive.requests
+    )
+
+
+def test_archive_that_stops_mid_range_delists_and_leaves_the_universe(
+    tmp_path: Path,
+) -> None:
+    _, client = _three_symbol_archive(tmp_path)
+
+    with client:
+        registry = build_archive_universe("spot", end=date(2024, 4, 1), client=client)
+
+    before = registry.universe_at(datetime(2024, 2, 20, tzinfo=UTC), "spot")
+    after = registry.universe_at(datetime(2024, 3, 20, tzinfo=UTC), "spot")
+
+    assert "DEADUSDT" in before
+    assert "DEADUSDT" not in after
+    assert "LIVEUSDT" in after
+
+
+def test_archive_that_starts_mid_range_is_absent_from_the_earlier_universe(
+    tmp_path: Path,
+) -> None:
+    _, client = _three_symbol_archive(tmp_path)
+
+    with client:
+        registry = build_archive_universe("spot", end=date(2024, 4, 1), client=client)
+
+    assert "LATEUSDT" not in registry.universe_at(
+        datetime(2024, 1, 31, 23, 59, tzinfo=UTC), "spot"
+    )
+    assert "LATEUSDT" in registry.universe_at(datetime(2024, 2, 1, tzinfo=UTC), "spot")
+
+
+def test_delist_reason_is_only_asserted_where_the_archive_substantiates_it(
+    tmp_path: Path,
+) -> None:
+    _, client = _three_symbol_archive(tmp_path)
+
+    with client:
+        listings = ingest_store.archive_listings(
+            "spot", end=date(2024, 4, 1), client=client
+        )
+
+    by_symbol = {listing.symbol: listing for listing in listings}
+
+    assert by_symbol["DEADUSDT"].delisted_at == datetime(2024, 3, 1, tzinfo=UTC)
+    assert by_symbol["DEADUSDT"].delist_reason == "delisted"
+    assert by_symbol["DEADUSDT"].successor is None
+    assert by_symbol["LIVEUSDT"].delisted_at is None
+    assert by_symbol["LIVEUSDT"].delist_reason is None
+    assert by_symbol["LATEUSDT"].listed_at == datetime(2024, 2, 1, tzinfo=UTC)
+
+
+def test_monthly_archive_that_starts_mid_month_lists_at_first_bar_not_month_start(
+    tmp_path: Path,
+) -> None:
+    """Key-span month starts are wider than published bars; membership must not claim them."""
+    archive, client = spot_archive(tmp_path)
+    published = days_between(date(2024, 1, 15), date(2024, 1, 31))
+    archive.add_monthly_klines("spot", "LATEUSDT", "1d", 2024, 1, days=published)
+
+    with client:
+        listings = ingest_store.archive_listings(
+            "spot", end=date(2024, 2, 1), client=client
+        )
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    listing = listings[0]
+    registry = UniverseRegistry(listings)
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+
+    assert listing.listed_at == datetime(2024, 1, 15, tzinfo=UTC)
+    assert listing.delisted_at is None
+    assert "LATEUSDT" not in registry.universe_at(
+        datetime(2024, 1, 14, tzinfo=UTC), "spot"
+    )
+    assert "LATEUSDT" in registry.universe_at(datetime(2024, 1, 15, tzinfo=UTC), "spot")
+    assert summary.failures == ()
+    assert summary.bars_written == len(published)
+    assert int(frame["ts"].min()) == day_ms(date(2024, 1, 15))
+    assert date(2024, 1, 1) not in {
+        datetime.fromtimestamp(int(value) / 1000, tz=UTC).date()
+        for value in frame["ts"]
+    }
+    validate_frame(frame, listings=listings, timeframe="1d")
+
+
+def test_monthly_archive_that_ends_mid_month_delists_the_day_after_last_bar(
+    tmp_path: Path,
+) -> None:
+    """A last monthly key covering the calendar month must not invent post-halt days."""
+    archive, client = spot_archive(tmp_path)
+    last_days = days_between(date(2024, 2, 1), date(2024, 2, 11))
+    archive.add_monthly_klines("spot", "DEADUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("spot", "DEADUSDT", "1d", 2024, 2, days=last_days)
+
+    with client:
+        listings = ingest_store.archive_listings(
+            "spot", end=date(2024, 4, 1), client=client
+        )
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 4, 1),
+            client=client,
+            asof=day_ms(date(2024, 4, 1)),
+        )
+
+    listing = listings[0]
+    registry = UniverseRegistry(listings)
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 4, 1))
+    )
+
+    assert listing.delisted_at == datetime(2024, 2, 12, tzinfo=UTC)
+    assert listing.delist_reason == "delisted"
+    assert "DEADUSDT" in registry.universe_at(datetime(2024, 2, 11, tzinfo=UTC), "spot")
+    assert "DEADUSDT" not in registry.universe_at(
+        datetime(2024, 2, 12, tzinfo=UTC), "spot"
+    )
+    assert summary.failures == ()
+    assert summary.bars_written == 31 + len(last_days)
+    assert int(frame["ts"].max()) == day_ms(date(2024, 2, 11))
+    validate_frame(frame, listings=listings, timeframe="1d")
+
+
+def test_trailing_daily_before_ingest_end_is_still_a_live_listing(
+    tmp_path: Path,
+) -> None:
+    """Last actual bar can precede ingest end without being a delisting."""
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "LIVEUSDT", "1d", 2024, 1)
+    for day in days_between(date(2024, 2, 1), date(2024, 2, 10)):
+        archive.add_daily_klines("spot", "LIVEUSDT", "1d", day)
+
+    with client:
+        listings = ingest_store.archive_listings(
+            "spot", end=date(2024, 2, 15), client=client
+        )
+
+    assert listings[0].listed_at == datetime(2024, 1, 1, tzinfo=UTC)
+    assert listings[0].delisted_at is None
+
+
+def test_mid_month_listing_bounds_still_drop_an_interior_hole(tmp_path: Path) -> None:
+    """Tightening bounds must not excuse a hole between the first and last published bar."""
+    archive, client = spot_archive(tmp_path)
+    published = [
+        day
+        for day in days_between(date(2024, 1, 15), date(2024, 1, 31))
+        if day != date(2024, 1, 20)
+    ]
+    archive.add_monthly_klines("spot", "HOLEUSDT", "1d", 2024, 1, days=published)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+
+    assert summary.bars_written == 0
+    assert frame.empty
+    assert [failure.symbol for failure in summary.failures] == ["HOLEUSDT"]
+    assert "gap" in summary.failures[0].reason
+
+
+def test_listing_bounds_override_a_fully_priced_bar() -> None:
+    """A complete-looking bar outside its listing window is still not tradable."""
+    registry = UniverseRegistry(
+        [
+            Listing(
+                symbol="WINDOWUSDT",
+                exchange="binance",
+                market_type="spot",
+                listed_at=datetime(2024, 2, 1, tzinfo=UTC),
+                delisted_at=datetime(2024, 3, 1, tzinfo=UTC),
+                delist_reason="delisted",
+            )
+        ]
+    )
+    bars = pd.DataFrame(
+        {
+            "ts": [
+                day_ms(date(2024, 1, 15)),
+                day_ms(date(2024, 2, 15)),
+                day_ms(date(2024, 3, 15)),
+            ],
+            "symbol": "WINDOWUSDT",
+            "market_type": "spot",
+            "open": [10.0, 10.0, 10.0],
+            "high": [11.0, 11.0, 11.0],
+            "low": [9.0, 9.0, 9.0],
+            "close": [10.5, 10.5, 10.5],
+        }
+    )
+
+    mask = ingest_store.membership_mask(bars, registry, "spot")
+
+    assert mask.tolist() == [False, True, False]
+
+
+def test_mislabelled_archive_cannot_smuggle_a_bar_into_an_earlier_universe(
+    tmp_path: Path,
+) -> None:
+    """An archive whose contents predate its own key must not extend history."""
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "SLIPUSDT", "1d", 2024, 2)
+    archive.add_daily_klines("spot", "SLIPUSDT", "1d", date(2024, 3, 6))
+    archive.add(
+        kline_archive_key("spot", "SLIPUSDT", "1d", date(2024, 3, 5)),
+        kline_zip((date(2024, 1, 20),)),
+    )
+
+    with client:
+        ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 3, 15),
+            client=client,
+            asof=day_ms(date(2024, 4, 2)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 4, 2))
+    )
+    smuggled = frame.loc[frame["ts"] == day_ms(date(2024, 1, 20))]
+
+    assert smuggled.empty or not bool(smuggled["in_universe"].any())
+    assert not bool(
+        frame.loc[
+            (frame["ts"] == day_ms(date(2024, 1, 20))) & (frame["in_universe"]),
+            "in_universe",
+        ].any()
+    )
+
+
+def test_survivorship_membership_is_written_to_the_store(tmp_path: Path) -> None:
+    _, client = _three_symbol_archive(tmp_path)
+
+    with client:
+        ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 4, 1),
+            client=client,
+            asof=day_ms(date(2024, 4, 2)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 4, 2))
+    )
+    dead = frame.loc[frame["symbol"] == "DEADUSDT"]
+    late = frame.loc[frame["symbol"] == "LATEUSDT"]
+
+    assert dead["ts"].max() == day_ms(date(2024, 2, 29))
+    assert bool(dead["in_universe"].all())
+    assert late["ts"].min() == day_ms(date(2024, 2, 1))
+    assert not (late["ts"] < day_ms(date(2024, 2, 1))).any()
+
+
+# --------------------------------------------------------------------------
+# Funding join
+# --------------------------------------------------------------------------
+
+
+def _perp_archive(
+    tmp_path: Path, prints: Mapping[int, float]
+) -> tuple[FakeArchive, BinanceArchiveClient]:
+    archive, client = spot_archive(tmp_path)
+    for day in days_between(date(2024, 1, 1), date(2024, 1, 3)):
+        archive.add_daily_klines("perp", "PERPUSDT", "1d", day)
+    archive.add_funding("PERPUSDT", date(2024, 1, 1), prints)
+    return archive, client
+
+
+def _perp_rows(tmp_path: Path, prints: Mapping[int, float]) -> pd.DataFrame:
+    _, client = _perp_archive(tmp_path, prints)
+    with client:
+        ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 4),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+    return frame.set_index("ts").sort_index()
+
+
+def test_funding_uses_only_prints_published_inside_the_bar(tmp_path: Path) -> None:
+    prints = {
+        **eight_hourly(date(2024, 1, 1), (0.001, 0.002, 0.003)),
+        **eight_hourly(date(2024, 1, 2), (0.010, 0.010, 0.010)),
+        **eight_hourly(date(2024, 1, 3), (0.004,)),
+    }
+
+    rows = _perp_rows(tmp_path, prints)
+
+    assert rows.loc[day_ms(date(2024, 1, 1)), "funding_8h"] == pytest.approx(0.002)
+    assert rows.loc[day_ms(date(2024, 1, 2)), "funding_8h"] == pytest.approx(0.010)
+    assert rows.loc[day_ms(date(2024, 1, 3)), "funding_8h"] == pytest.approx(0.004)
+
+
+def test_bar_without_a_funding_print_is_nan_and_out_of_universe(
+    tmp_path: Path,
+) -> None:
+    prints = {
+        **eight_hourly(date(2024, 1, 1), (0.001, 0.002, 0.003)),
+        **eight_hourly(date(2024, 1, 3), (0.004,)),
+    }
+    _, client = _perp_archive(tmp_path, prints)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 4),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+    reasons = {failure.symbol: failure.reason for failure in summary.failures}
+
+    assert frame.empty
+    assert "PERPUSDT" in reasons
+    assert "gap" in reasons["PERPUSDT"]
+
+
+def test_zero_funding_is_preserved_and_never_confused_with_missing(
+    tmp_path: Path,
+) -> None:
+    prints = {
+        **eight_hourly(date(2024, 1, 1), (0.0, 0.0, 0.0)),
+        **eight_hourly(date(2024, 1, 2), (0.0, 0.0, 0.0)),
+        **eight_hourly(date(2024, 1, 3), (0.0, 0.0, 0.0)),
+    }
+
+    rows = _perp_rows(tmp_path, prints)
+
+    assert rows["funding_8h"].tolist() == [0.0, 0.0, 0.0]
+    assert rows["funding_8h"].notna().all()
+    assert bool(rows["in_universe"].all())
+
+
+def test_spot_rows_carry_nan_funding_without_leaving_the_universe(
+    tmp_path: Path,
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "BTCUSDT", "1d", 2024, 1)
+
+    with client:
+        ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+
+    assert frame["funding_8h"].isna().all()
+    assert bool(frame["in_universe"].all())
+
+
+# --------------------------------------------------------------------------
+# Store contract, partitioning, and idempotency
+# --------------------------------------------------------------------------
+
+
+def _long_history_archive(tmp_path: Path) -> tuple[FakeArchive, BinanceArchiveClient]:
+    archive, client = spot_archive(tmp_path)
+    for symbol, base in (("AAAUSDT", 100.0), ("BBBUSDT", 50.0)):
+        for year, month in ((2023, 11), (2023, 12), (2024, 1), (2024, 2)):
+            archive.add_monthly_klines(
+                "spot", symbol, "1d", year, month, base=base
+            )
+    return archive, client
+
+
+def test_written_frame_round_trips_through_store_features_and_panel(
+    tmp_path: Path,
+) -> None:
+    _, client = _long_history_archive(tmp_path)
+    asof = day_ms(date(2024, 3, 2))
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2023, 11, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=asof,
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(timeframe="1d", query_ts=asof)
+
+    assert list(REQUIRED_COLUMNS) == frame.columns.tolist()
+    assert summary.bars_written == len(frame)
+
+    featured = add_execution_features(frame)
+    panel = Panel.from_long(featured.drop(columns=["asof"]), market_type="spot")
+
+    assert set(panel.symbols) == {"AAAUSDT", "BBBUSDT"}
+    assert bool(panel.universe_mask().to_numpy().any())
+
+
+def test_multi_year_range_writes_one_file_per_symbol_per_year(tmp_path: Path) -> None:
+    _, client = _long_history_archive(tmp_path)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2023, 11, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=day_ms(date(2024, 3, 2)),
+        )
+
+    partitions = sorted(
+        path.name
+        for path in (tmp_path / "store" / "timeframe=1d").iterdir()
+        if path.is_dir()
+    )
+
+    assert partitions == ["year=2023", "year=2024"]
+    for partition in partitions:
+        files = list(
+            (tmp_path / "store" / "timeframe=1d" / partition).glob("part-*.parquet")
+        )
+        assert len(files) == 2
+        symbols = {
+            pd.read_parquet(path)["symbol"].unique().tolist()[0] for path in files
+        }
+        assert symbols == {"AAAUSDT", "BBBUSDT"}
+    assert len(summary.files_written) == 4
+
+
+def test_reingesting_the_same_range_does_not_duplicate_logical_rows(
+    tmp_path: Path,
+) -> None:
+    archive, client = _long_history_archive(tmp_path)
+    store_root = tmp_path / "store"
+
+    with client:
+        first = ingest_to_store(
+            store_root,
+            market_type="spot",
+            timeframe="1d",
+            start=date(2023, 11, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=day_ms(date(2024, 3, 2)),
+        )
+        downloads_after_first = len(archive.downloads)
+        second = ingest_to_store(
+            store_root,
+            market_type="spot",
+            timeframe="1d",
+            start=date(2023, 11, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=day_ms(date(2024, 3, 3)),
+        )
+
+    frame = ParquetStore(store_root).read(
+        timeframe="1d", query_ts=day_ms(date(2024, 3, 3))
+    )
+
+    assert first.bars_written > 0
+    assert second.bars_written == 0
+    assert second.files_written == ()
+    assert len(frame) == first.bars_written
+    assert not frame.duplicated(["ts", "symbol", "market_type"]).any()
+    assert frame["asof"].nunique() == 1
+    assert int(frame["asof"].iloc[0]) == day_ms(date(2024, 3, 2))
+    assert len(archive.downloads) == downloads_after_first
+
+
+def test_one_asof_per_run_makes_a_reingest_a_distinguishable_revision(
+    tmp_path: Path,
+) -> None:
+    _, client = _long_history_archive(tmp_path)
+    asof = day_ms(date(2024, 3, 2))
+
+    with client:
+        ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2023, 11, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=asof,
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(timeframe="1d", query_ts=asof)
+
+    assert frame["asof"].unique().tolist() == [asof]
+    assert ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=asof - 1
+    ).empty
+
+
+def test_default_asof_is_the_ingest_wall_clock(tmp_path: Path) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "BTCUSDT", "1d", 2024, 1)
+    before = int(datetime.now(UTC).timestamp() * 1000)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+        )
+
+    assert before <= summary.asof <= int(datetime.now(UTC).timestamp() * 1000)
+
+
+def test_missing_days_are_absent_rather_than_fabricated(tmp_path: Path) -> None:
+    archive, client = spot_archive(tmp_path)
+    for day in days_between(date(2024, 1, 1), date(2024, 1, 10)):
+        if day == date(2024, 1, 5):
+            continue
+        archive.add_daily_klines("spot", "GAPUSDT", "1d", day)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 11),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+
+    assert day_ms(date(2024, 1, 5)) not in frame["ts"].tolist()
+    assert "GAPUSDT" not in set(frame["symbol"].unique())
+    assert summary.bars_written == 0
+    assert [failure.symbol for failure in summary.failures] == ["GAPUSDT"]
+    assert "gap" in summary.failures[0].reason
+
+
+# --------------------------------------------------------------------------
+# Resilience: one bad symbol must not abort a multi-hundred-symbol run
+# --------------------------------------------------------------------------
+
+
+def test_corrupt_symbol_archive_is_reported_and_does_not_abort_the_run(
+    tmp_path: Path,
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "GOODUSDT", "1d", 2024, 1)
+    archive.add(
+        monthly_kline_archive_key("spot", "BADUSDT", "1d", date(2024, 1, 1)),
+        b"this is not a zip file",
+    )
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+    reasons = {failure.symbol: failure.reason for failure in summary.failures}
+
+    assert set(frame["symbol"].unique()) == {"GOODUSDT"}
+    assert summary.symbols_attempted == 2
+    assert summary.symbols_with_data == 1
+    assert "BADUSDT" in reasons
+    assert "ZIP" in reasons["BADUSDT"]
+
+
+def test_missing_listed_archive_is_reported_and_does_not_abort_the_run(
+    tmp_path: Path,
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "GOODUSDT", "1d", 2024, 1)
+    vanished = archive.add_monthly_klines("spot", "GONEUSDT", "1d", 2024, 1)
+    archive.missing.add(vanished)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    reasons = {failure.symbol: failure.reason for failure in summary.failures}
+
+    assert summary.symbols_with_data == 1
+    assert "GONEUSDT" in reasons
+    assert "404" in reasons["GONEUSDT"]
+    assert summary.bars_written == 31
+
+
+def test_symbol_without_any_archive_is_reported_rather_than_dropped_silently(
+    tmp_path: Path,
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "GOODUSDT", "1d", 2024, 1)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            symbols=("GOODUSDT", "GHOSTUSDT"),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    reasons = {failure.symbol: failure.reason for failure in summary.failures}
+
+    assert "GHOSTUSDT" in reasons
+    assert "no archive" in reasons["GHOSTUSDT"]
+
+
+def test_unreadable_symbol_listing_is_reported_and_does_not_abort_the_run(
+    tmp_path: Path,
+) -> None:
+    archive = FakeArchive()
+    archive.add_monthly_klines("spot", "GOODUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("spot", "XMLUSDT", "1d", 2024, 1)
+    archive.malformed_listing_prefixes.add("data/spot/monthly/klines/XMLUSDT/1d/")
+    client = archive.client(tmp_path / "cache")
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    reasons = {failure.symbol: failure.reason for failure in summary.failures}
+
+    assert summary.symbols_with_data == 1
+    assert summary.bars_written == 31
+    assert "malformed" in reasons["XMLUSDT"]
+
+
+def test_perp_without_any_funding_archive_is_priced_but_never_tradable(
+    tmp_path: Path,
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    for day in days_between(date(2024, 1, 1), date(2024, 1, 3)):
+        archive.add_daily_klines("perp", "NOFUNDUSDT", "1d", day)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 4),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+
+    assert summary.bars_written == 0
+    assert frame.empty
+    assert not bool(frame["in_universe"].any()) if not frame.empty else True
+    assert [failure.symbol for failure in summary.failures] == ["NOFUNDUSDT"]
+    assert "gap" in summary.failures[0].reason
+
+
+def test_ingest_closes_the_client_it_creates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "BTCUSDT", "1d", 2024, 1)
+    closed: list[bool] = []
+    monkeypatch.setattr(client, "close", lambda: closed.append(True))
+    monkeypatch.setattr(
+        ingest_store, "BinanceArchiveClient", lambda **_kwargs: client
+    )
+
+    summary = ingest_to_store(
+        tmp_path / "store",
+        market_type="spot",
+        timeframe="1d",
+        start=date(2024, 1, 1),
+        end=date(2024, 2, 1),
+        asof=day_ms(date(2024, 2, 1)),
+    )
+
+    assert summary.bars_written == 31
+    assert closed == [True]
+
+
+def test_summary_reports_attempted_counts_and_timestamp_bounds(
+    tmp_path: Path,
+) -> None:
+    _, client = _three_symbol_archive(tmp_path)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 4, 1),
+            client=client,
+            asof=day_ms(date(2024, 4, 2)),
+        )
+
+    assert isinstance(summary, IngestSummary)
+    assert summary.symbols_attempted == 3
+    assert summary.symbols_with_data == 3
+    assert summary.first_ts == day_ms(date(2024, 1, 1))
+    assert summary.last_ts == day_ms(date(2024, 3, 31))
+    assert summary.bars_written == 91 + 60 + 60
+    assert json.loads(summary_json(summary))["symbols_with_data"] == 3
+
+
+def test_symbol_limit_bounds_a_first_run(tmp_path: Path) -> None:
+    _, client = _three_symbol_archive(tmp_path)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 4, 1),
+            limit=1,
+            client=client,
+            asof=day_ms(date(2024, 4, 2)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 4, 2))
+    )
+
+    assert summary.symbols_attempted == 1
+    assert set(frame["symbol"].unique()) == {"DEADUSDT"}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"market_type": "option"}, "market type"),
+        ({"timeframe": "5m"}, "unsupported timeframe"),
+        ({"end": date(2024, 1, 1)}, "end must be later"),
+        ({"limit": 0}, "limit"),
+    ],
+)
+def test_ingest_rejects_invalid_requests(
+    tmp_path: Path, kwargs: dict[str, object], message: str
+) -> None:
+    request: dict[str, object] = {
+        "market_type": "spot",
+        "timeframe": "1d",
+        "start": date(2024, 1, 1),
+        "end": date(2024, 2, 1),
+    }
+    request.update(kwargs)
+
+    with pytest.raises(ValueError, match=message):
+        ingest_to_store(tmp_path / "store", **request)  # type: ignore[arg-type]
+
+
+def test_partial_symbol_failure_drops_the_whole_symbol_rather_than_half_of_it(
+    tmp_path: Path,
+) -> None:
+    """Half a history written as if whole is a silent lie; the symbol is dropped."""
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "HALFUSDT", "1d", 2024, 1)
+    archive.add(
+        monthly_kline_archive_key("spot", "HALFUSDT", "1d", date(2024, 2, 1)),
+        b"truncated",
+    )
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=day_ms(date(2024, 3, 1)),
+        )
+
+    assert summary.bars_written == 0
+    assert summary.symbols_with_data == 0
+    assert [failure.symbol for failure in summary.failures] == ["HALFUSDT"]
+
+
+def test_funding_archives_outside_the_range_are_never_downloaded(
+    tmp_path: Path,
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    for day in days_between(date(2024, 6, 1), date(2024, 6, 3)):
+        archive.add_daily_klines("perp", "PERPUSDT", "1d", day)
+    stale = archive.add_funding(
+        "PERPUSDT", date(2024, 1, 1), eight_hourly(date(2024, 1, 1), (0.001,))
+    )
+    wanted = archive.add_funding(
+        "PERPUSDT", date(2024, 6, 1), eight_hourly(date(2024, 6, 1), (0.001,))
+    )
+
+    with client:
+        ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 6, 1),
+            end=date(2024, 6, 4),
+            client=client,
+            asof=day_ms(date(2024, 7, 1)),
+        )
+
+    assert wanted in archive.downloads
+    assert stale not in archive.downloads
+
+
+def test_funding_aggregation_is_a_mean_and_is_empty_safe() -> None:
+    opened = day_ms(date(2024, 1, 1))
+    prints = pd.DataFrame(
+        {
+            "ts": [
+                opened,
+                opened + EIGHT_HOURS_MS,
+                opened + 2 * EIGHT_HOURS_MS,
+                opened + DAY_MS,
+            ],
+            "funding_8h": [0.001, 0.002, 0.006, -0.004],
+        }
+    )
+
+    daily = aggregate_funding(prints, timeframe="1d")
+    empty = aggregate_funding(
+        pd.DataFrame({"ts": [], "funding_8h": []}), timeframe="1d"
+    )
+
+    assert daily["ts"].tolist() == [opened, opened + DAY_MS]
+    assert daily["funding_8h"].tolist() == pytest.approx([0.003, -0.004])
+    assert empty.empty
+    with pytest.raises(ValueError, match="unsupported timeframe"):
+        aggregate_funding(prints, timeframe="5m")
+
+
+@pytest.mark.parametrize(
+    ("symbols", "limit", "message"),
+    [
+        (("BTCUSDT",), 0, "limit"),
+        ((), None, "at least one"),
+    ],
+)
+def test_symbol_resolution_rejects_impossible_selections(
+    symbols: tuple[str, ...], limit: int | None, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        resolve_symbols(
+            None,  # type: ignore[arg-type]
+            "spot",
+            symbols,
+            limit,
+        )
+
+
+def test_listing_cannot_be_derived_without_archive_evidence() -> None:
+    empty = SymbolCoverage("GHOSTUSDT", frozenset(), None, None)
+
+    with pytest.raises(ValueError, match="no archive coverage"):
+        coverage_listing(
+            empty, exchange="binance", market_type="spot", end=date(2024, 1, 1)
+        )
+
+
+def test_empty_ingest_writes_nothing_and_says_so(tmp_path: Path) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "BTCUSDT", "1d", 2024, 1)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2025, 1, 1),
+            end=date(2025, 2, 1),
+            client=client,
+            asof=day_ms(date(2025, 2, 1)),
+        )
+
+    assert summary.bars_written == 0
+    assert summary.first_ts is None
+    assert summary.last_ts is None
+    assert summary.files_written == ()
+
+
+# --------------------------------------------------------------------------
+# CLI surface
+# --------------------------------------------------------------------------
+
+
+def test_store_cli_ingests_the_requested_slice_and_prints_the_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "AAAUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("spot", "BBBUSDT", "1d", 2024, 1)
+
+    class Injected:
+        def __init__(self, **_kwargs: object) -> None:
+            self._client = client
+
+        def __enter__(self) -> BinanceArchiveClient:
+            return self._client
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(ingest_store, "BinanceArchiveClient", Injected)
+
+    exit_code = ingest_store.main(
+        [
+            "--store",
+            str(tmp_path / "store"),
+            "--market",
+            "spot",
+            "--timeframe",
+            "1d",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-02-01",
+            "--symbols",
+            "AAAUSDT,BBBUSDT",
+            "--limit",
+            "1",
+        ]
+    )
+
+    rendered = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert rendered["symbols_attempted"] == 1
+    assert rendered["bars_written"] == 31
+    assert rendered["failures"] == []
+
+
+def test_store_cli_exits_nonzero_when_a_symbol_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "AAAUSDT", "1d", 2024, 1)
+    archive.add(
+        monthly_kline_archive_key("spot", "BADUSDT", "1d", date(2024, 1, 1)),
+        b"not a zip",
+    )
+
+    class Injected:
+        def __init__(self, **_kwargs: object) -> None:
+            self._client = client
+
+        def __enter__(self) -> BinanceArchiveClient:
+            return self._client
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(ingest_store, "BinanceArchiveClient", Injected)
+
+    exit_code = ingest_store.main(
+        [
+            "--store",
+            str(tmp_path / "store"),
+            "--market",
+            "spot",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-02-01",
+        ]
+    )
+
+    assert exit_code == 1
+    assert json.loads(capsys.readouterr().out)["failures"][0]["symbol"] == "BADUSDT"
+
+
+def test_scripts_entrypoint_dispatches_both_subcommands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, tuple[str, ...]]] = []
+
+    def fake_gate(argv: Sequence[str] | None = None) -> int:
+        seen.append(("gate", tuple(argv or ())))
+        return 0
+
+    def fake_store(argv: Sequence[str] | None = None) -> int:
+        seen.append(("store", tuple(argv or ())))
+        return 3
+
+    monkeypatch.setattr(ingest_cli, "archive_gate_main", fake_gate)
+    monkeypatch.setattr(ingest_cli, "archive_store_main", fake_store)
+
+    assert ingest_cli.main(["gate", "--workers", "2"]) == 0
+    assert ingest_cli.main(["store", "--market", "perp"]) == 3
+    assert seen == [
+        ("gate", ("--workers", "2")),
+        ("store", ("--market", "perp")),
+    ]
+
+
+def test_fake_archive_rejects_any_call_outside_the_binance_archive(
+    tmp_path: Path,
+) -> None:
+    """The harness itself must fail loudly if a test escapes the mock."""
+    archive, _ = spot_archive(tmp_path)
+    http = httpx.Client(transport=archive.transport())
+
+    with pytest.raises(AssertionError, match="unexpected network call"):
+        http.get("https://example.invalid/whatever")
+
+    assert archive.requests == ["https://example.invalid/whatever"]
+
+
+# --------------------------------------------------------------------------
+# validate_frame wiring, incremental writes, and resume
+# --------------------------------------------------------------------------
+
+
+def _zero_price_kline_zip(days: Sequence[date]) -> bytes:
+    rows: list[list[str]] = []
+    for day in days:
+        opened = day_ms(day)
+        rows.append(
+            [
+                str(opened),
+                "0",
+                "1",
+                "0",
+                "0",
+                "10",
+                str(opened + DAY_MS - 1),
+                "1000",
+                "5",
+                "5",
+                "500",
+                "0",
+            ]
+        )
+    return _zipped(rows, "klines.csv")
+
+
+def _negative_volume_kline_zip(days: Sequence[date]) -> bytes:
+    rows: list[list[str]] = []
+    for offset, day in enumerate(days):
+        opened = day_ms(day)
+        price = 100.0 + offset
+        rows.append(
+            [
+                str(opened),
+                str(price),
+                str(price + 1.0),
+                str(price - 1.0),
+                str(price + 0.5),
+                "-1",
+                str(opened + DAY_MS - 1),
+                "1000",
+                "5",
+                "5",
+                "500",
+                "0",
+            ]
+        )
+    return _zipped(rows, "klines.csv")
+
+
+def test_limit_caps_sorted_archive_names_not_a_liquidity_rank(tmp_path: Path) -> None:
+    """`--limit` is a debug cap on sorted names. It must not pick by volume."""
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "THINUSDT", "1d", 2024, 1, base=1.0)
+    archive.add_monthly_klines("spot", "FATUSDT", "1d", 2024, 1, base=9_999.0)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            limit=1,
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+
+    assert summary.symbols_attempted == 1
+    assert set(frame["symbol"].unique()) == {"FATUSDT"}
+
+
+def test_validate_frame_is_invoked_on_every_symbol_before_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "AAAUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("spot", "BBBUSDT", "1d", 2024, 1)
+    seen: list[tuple[tuple[str, ...], int]] = []
+    original = validate_frame
+
+    def spy(frame: pd.DataFrame, *, listings: object, timeframe: str) -> object:
+        symbols = tuple(sorted(str(value) for value in frame["symbol"].unique()))
+        seen.append((symbols, len(frame)))
+        return original(frame, listings=listings, timeframe=timeframe)
+
+    monkeypatch.setattr(ingest_store, "validate_frame", spy)
+
+    with client:
+        ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    assert seen == [(("AAAUSDT",), 31), (("BBBUSDT",), 31)]
+
+
+def test_zero_in_universe_price_fails_the_symbol_and_writes_nothing_for_it(
+    tmp_path: Path,
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "GOODUSDT", "1d", 2024, 1)
+    archive.add(
+        monthly_kline_archive_key("spot", "ZEROUSDT", "1d", date(2024, 1, 1)),
+        _zero_price_kline_zip(month_days(2024, 1)),
+    )
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+    reasons = {failure.symbol: failure.reason for failure in summary.failures}
+
+    assert set(frame["symbol"].unique()) == {"GOODUSDT"}
+    assert "ZEROUSDT" in reasons
+    assert "nonpositive" in reasons["ZEROUSDT"]
+
+
+def test_negative_volume_fails_the_symbol_and_does_not_abort_the_run(
+    tmp_path: Path,
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "GOODUSDT", "1d", 2024, 1)
+    archive.add(
+        monthly_kline_archive_key("spot", "NEGVOLUSDT", "1d", date(2024, 1, 1)),
+        _negative_volume_kline_zip(month_days(2024, 1)),
+    )
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+    reasons = {failure.symbol: failure.reason for failure in summary.failures}
+
+    assert set(frame["symbol"].unique()) == {"GOODUSDT"}
+    assert "NEGVOLUSDT" in reasons
+    assert "negative volume" in reasons["NEGVOLUSDT"]
+
+
+def test_funding_at_absolute_0_05_fails_the_perp_and_writes_none_of_it(
+    tmp_path: Path,
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    for day in days_between(date(2024, 1, 1), date(2024, 1, 3)):
+        archive.add_daily_klines("perp", "WIDEUSDT", "1d", day)
+        archive.add_daily_klines("perp", "OKUSDT", "1d", day)
+    archive.add_funding(
+        "WIDEUSDT",
+        date(2024, 1, 1),
+        {
+            **eight_hourly(date(2024, 1, 1), (0.05, 0.05, 0.05)),
+            **eight_hourly(date(2024, 1, 2), (0.05, 0.05, 0.05)),
+            **eight_hourly(date(2024, 1, 3), (0.05, 0.05, 0.05)),
+        },
+    )
+    archive.add_funding(
+        "OKUSDT",
+        date(2024, 1, 1),
+        {
+            **eight_hourly(date(2024, 1, 1), (0.001, 0.001, 0.001)),
+            **eight_hourly(date(2024, 1, 2), (0.001, 0.001, 0.001)),
+            **eight_hourly(date(2024, 1, 3), (0.001, 0.001, 0.001)),
+        },
+    )
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 4),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+    reasons = {failure.symbol: failure.reason for failure in summary.failures}
+
+    assert set(frame["symbol"].unique()) == {"OKUSDT"}
+    assert "WIDEUSDT" in reasons
+    assert "funding" in reasons["WIDEUSDT"]
+
+
+def test_gap_inside_the_requested_window_drops_the_whole_symbol(
+    tmp_path: Path,
+) -> None:
+    """A hole must not be written as if it were a halt; the symbol is failed."""
+    archive, client = spot_archive(tmp_path)
+    for day in days_between(date(2024, 1, 1), date(2024, 1, 10)):
+        archive.add_daily_klines("spot", "GOODUSDT", "1d", day)
+        if day == date(2024, 1, 5):
+            continue
+        archive.add_daily_klines("spot", "GAPUSDT", "1d", day)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 11),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+    reasons = {failure.symbol: failure.reason for failure in summary.failures}
+
+    assert "GAPUSDT" not in set(frame["symbol"].unique())
+    assert "GOODUSDT" in set(frame["symbol"].unique())
+    assert "GAPUSDT" in reasons
+    assert "gap" in reasons["GAPUSDT"]
+    assert summary.symbols_with_data == 1
+    good = frame.loc[frame["symbol"] == "GOODUSDT"]
+    assert day_ms(date(2024, 1, 5)) in good["ts"].tolist()
+
+
+def test_partial_range_does_not_treat_history_before_start_as_a_gap(
+    tmp_path: Path,
+) -> None:
+    """Listing bounds for validation are the ingest window, not lifetime."""
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "OLDUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("spot", "OLDUSDT", "1d", 2024, 2)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 2, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=day_ms(date(2024, 3, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 3, 1))
+    )
+
+    assert summary.failures == ()
+    assert summary.symbols_with_data == 1
+    assert frame["ts"].min() == day_ms(date(2024, 2, 1))
+    assert len(frame) == 29
+
+
+def test_each_store_write_contains_exactly_one_symbol(tmp_path: Path) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "AAAUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("spot", "BBBUSDT", "1d", 2024, 1)
+    written_symbols: list[tuple[str, ...]] = []
+    original = ParquetStore.write
+
+    def spy(
+        self: ParquetStore, frame: pd.DataFrame, *, timeframe: str
+    ) -> Path:
+        written_symbols.append(
+            tuple(sorted(str(value) for value in frame["symbol"].unique()))
+        )
+        return original(self, frame, timeframe=timeframe)
+
+    ParquetStore.write = spy  # type: ignore[method-assign]
+    try:
+        with client:
+            summary = ingest_to_store(
+                tmp_path / "store",
+                market_type="spot",
+                timeframe="1d",
+                start=date(2024, 1, 1),
+                end=date(2024, 2, 1),
+                client=client,
+                asof=day_ms(date(2024, 2, 1)),
+            )
+    finally:
+        ParquetStore.write = original  # type: ignore[method-assign]
+
+    assert written_symbols == [("AAAUSDT",), ("BBBUSDT",)]
+    assert len(summary.files_written) == 2
+
+
+def test_first_symbol_is_on_disk_before_the_second_symbol_is_fetched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "AAAUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("spot", "BBBUSDT", "1d", 2024, 1)
+    events: list[str] = []
+    original_frame = ingest_store._symbol_frame
+    original_write = ParquetStore.write
+
+    def fetch(
+        client: BinanceArchiveClient,
+        coverage: SymbolCoverage,
+        **kwargs: object,
+    ) -> pd.DataFrame:
+        events.append(f"fetch:{coverage.symbol}")
+        return original_frame(client, coverage, **kwargs)
+
+    def write(self: ParquetStore, frame: pd.DataFrame, *, timeframe: str) -> Path:
+        symbol = str(frame["symbol"].iloc[0])
+        events.append(f"write:{symbol}")
+        path = original_write(self, frame, timeframe=timeframe)
+        events.append(f"exists:{path.exists()}")
+        return path
+
+    monkeypatch.setattr(ingest_store, "_symbol_frame", fetch)
+    monkeypatch.setattr(ParquetStore, "write", write)
+
+    with client:
+        ingest_to_store(
+            tmp_path / "store",
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    assert events == [
+        "fetch:AAAUSDT",
+        "write:AAAUSDT",
+        "exists:True",
+        "fetch:BBBUSDT",
+        "write:BBBUSDT",
+        "exists:True",
+    ]
+
+
+def test_resume_skips_a_symbol_already_fully_present_for_the_requested_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "AAAUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("spot", "BBBUSDT", "1d", 2024, 1)
+    store_root = tmp_path / "store"
+    fetches: list[str] = []
+    original_frame = ingest_store._symbol_frame
+
+    def fetch(
+        client: BinanceArchiveClient,
+        coverage: SymbolCoverage,
+        **kwargs: object,
+    ) -> pd.DataFrame:
+        fetches.append(coverage.symbol)
+        return original_frame(client, coverage, **kwargs)
+
+    monkeypatch.setattr(ingest_store, "_symbol_frame", fetch)
+
+    with client:
+        first = ingest_to_store(
+            store_root,
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+        files_after_first = sorted(
+            path.name
+            for path in (store_root / "timeframe=1d").rglob("part-*.parquet")
+        )
+        downloads_after_first = len(archive.downloads)
+        fetches.clear()
+        second = ingest_to_store(
+            store_root,
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 2)),
+        )
+
+    files_after_second = sorted(
+        path.name for path in (store_root / "timeframe=1d").rglob("part-*.parquet")
+    )
+    frame = ParquetStore(store_root).read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 2))
+    )
+
+    assert first.bars_written == 62
+    assert second.bars_written == 0
+    assert second.files_written == ()
+    assert fetches == []
+    assert files_after_second == files_after_first
+    assert len(archive.downloads) == downloads_after_first
+    assert not frame.duplicated(["ts", "symbol", "market_type"]).any()
+    assert len(frame) == 62
+
+
+def test_resume_skips_a_symbol_whose_first_archive_started_mid_month(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Skip expected timestamps must use published bars, not the monthly key's month start."""
+    archive, client = spot_archive(tmp_path)
+    published = days_between(date(2024, 1, 15), date(2024, 1, 31))
+    archive.add_monthly_klines("spot", "LATEUSDT", "1d", 2024, 1, days=published)
+    store_root = tmp_path / "store"
+    fetches: list[str] = []
+    original_frame = ingest_store._symbol_frame
+
+    def fetch(
+        client: BinanceArchiveClient,
+        coverage: SymbolCoverage,
+        **kwargs: object,
+    ) -> pd.DataFrame:
+        fetches.append(coverage.symbol)
+        return original_frame(client, coverage, **kwargs)
+
+    monkeypatch.setattr(ingest_store, "_symbol_frame", fetch)
+
+    with client:
+        first = ingest_to_store(
+            store_root,
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+        fetches.clear()
+        second = ingest_to_store(
+            store_root,
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 2, 2)),
+        )
+
+    frame = ParquetStore(store_root).read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 2))
+    )
+
+    assert first.bars_written == len(published)
+    assert second.bars_written == 0
+    assert fetches == []
+    assert int(frame["ts"].min()) == day_ms(date(2024, 1, 15))
+    assert len(frame) == len(published)
+
+
+def test_resume_re_fetches_a_symbol_whose_stored_range_is_shorter_than_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("spot", "AAAUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("spot", "AAAUSDT", "1d", 2024, 2)
+    store_root = tmp_path / "store"
+    fetches: list[str] = []
+    original_frame = ingest_store._symbol_frame
+
+    def fetch(
+        client: BinanceArchiveClient,
+        coverage: SymbolCoverage,
+        **kwargs: object,
+    ) -> pd.DataFrame:
+        fetches.append(coverage.symbol)
+        return original_frame(client, coverage, **kwargs)
+
+    monkeypatch.setattr(ingest_store, "_symbol_frame", fetch)
+
+    with client:
+        ingest_to_store(
+            store_root,
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 2, 1),
+            client=client,
+            asof=day_ms(date(2024, 3, 1)),
+        )
+        fetches.clear()
+        second = ingest_to_store(
+            store_root,
+            market_type="spot",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=day_ms(date(2024, 3, 2)),
+        )
+
+    frame = ParquetStore(store_root).read(
+        timeframe="1d", query_ts=day_ms(date(2024, 3, 2))
+    )
+
+    assert fetches == ["AAAUSDT"]
+    assert second.bars_written == 31 + 29
+    assert frame["ts"].min() == day_ms(date(2024, 1, 1))
+    assert frame["ts"].max() == day_ms(date(2024, 2, 29))
+
+
+def test_membership_mask_still_excludes_perp_bars_without_funding() -> None:
+    """Missing funding is a membership hole, not a zero. Ingest refuses the symbol."""
+    registry = UniverseRegistry(
+        [
+            Listing(
+                symbol="PERPUSDT",
+                exchange="binance",
+                market_type="perp",
+                listed_at=datetime(2024, 1, 1, tzinfo=UTC),
+            )
+        ]
+    )
+    bars = pd.DataFrame(
+        {
+            "ts": [
+                day_ms(date(2024, 1, 1)),
+                day_ms(date(2024, 1, 2)),
+                day_ms(date(2024, 1, 3)),
+            ],
+            "symbol": "PERPUSDT",
+            "market_type": "perp",
+            "open": [10.0, 10.0, 10.0],
+            "high": [11.0, 11.0, 11.0],
+            "low": [9.0, 9.0, 9.0],
+            "close": [10.5, 10.5, 10.5],
+            "funding_8h": [0.001, float("nan"), 0.004],
+        }
+    )
+
+    mask = ingest_store.membership_mask(bars, registry, "perp")
+
+    assert mask.tolist() == [True, False, True]
+
+
+def test_perp_funding_hole_fails_the_symbol_rather_than_writing_an_untradable_gap(
+    tmp_path: Path,
+) -> None:
+    prints = {
+        **eight_hourly(date(2024, 1, 1), (0.001, 0.002, 0.003)),
+        **eight_hourly(date(2024, 1, 3), (0.004,)),
+    }
+    _, client = _perp_archive(tmp_path, prints)
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 1, 4),
+            client=client,
+            asof=day_ms(date(2024, 2, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 2, 1))
+    )
+    reasons = {failure.symbol: failure.reason for failure in summary.failures}
+
+    assert summary.bars_written == 0
+    assert frame.empty
+    assert "PERPUSDT" in reasons
+    assert "gap" in reasons["PERPUSDT"]
+
+
+# --------------------------------------------------------------------------
+# Trailing unpublished funding is omitted; interior holes still fail
+# --------------------------------------------------------------------------
+
+
+def month_funding(year: int, month: int, rate: float) -> dict[int, float]:
+    prints: dict[int, float] = {}
+    for day in month_days(year, month):
+        prints.update(eight_hourly(day, (rate, rate, rate)))
+    return prints
+
+
+def _live_perp_with_trailing_unfunded_month(
+    tmp_path: Path,
+) -> tuple[FakeArchive, BinanceArchiveClient]:
+    """January is jointly available; February klines exist but funding is unpublished."""
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("perp", "LIVEUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("perp", "LIVEUSDT", "1d", 2024, 2)
+    archive.add_funding("LIVEUSDT", date(2024, 1, 1), month_funding(2024, 1, 0.001))
+    return archive, client
+
+
+def test_live_perp_omits_trailing_unfunded_month_and_validates(
+    tmp_path: Path,
+) -> None:
+    """August-style lag: klines exist, monthly funding does not. Omit the tail."""
+    _, client = _live_perp_with_trailing_unfunded_month(tmp_path)
+    asof = day_ms(date(2024, 3, 1))
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=asof,
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(timeframe="1d", query_ts=asof)
+    in_universe = frame.loc[frame["in_universe"]]
+
+    assert summary.failures == ()
+    assert summary.symbols_with_data == 1
+    assert summary.bars_written == 31
+    assert int(frame["ts"].max()) == day_ms(date(2024, 1, 31))
+    assert day_ms(date(2024, 2, 1)) not in frame["ts"].tolist()
+    assert in_universe["funding_8h"].notna().all()
+    assert bool(in_universe["in_universe"].all())
+    validate_frame(
+        frame,
+        listings=[
+            Listing(
+                symbol="LIVEUSDT",
+                exchange="binance",
+                market_type="perp",
+                listed_at=datetime(2024, 1, 1, tzinfo=UTC),
+            )
+        ],
+        timeframe="1d",
+    )
+
+
+def test_trailing_unfunded_month_is_omitted_not_imputed(tmp_path: Path) -> None:
+    """Zero / ffill / bfill of unpublished funding would materialize February."""
+    _, client = _live_perp_with_trailing_unfunded_month(tmp_path)
+    asof = day_ms(date(2024, 3, 1))
+
+    with client:
+        ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=asof,
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(timeframe="1d", query_ts=asof)
+    february = [
+        day_ms(day) for day in days_between(date(2024, 2, 1), date(2024, 2, 29))
+    ]
+
+    assert not set(february).intersection(frame["ts"].tolist())
+    assert frame["funding_8h"].tolist() == pytest.approx([0.001] * 31)
+    assert not bool((frame["funding_8h"] == 0.0).any())
+    assert frame["funding_8h"].notna().all()
+
+
+def test_interior_missing_month_still_drops_the_whole_perp(tmp_path: Path) -> None:
+    """A hole inside listing→delisting is not a publication lag; write nothing."""
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("perp", "HOLEUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("perp", "HOLEUSDT", "1d", 2024, 3)
+    archive.add_funding("HOLEUSDT", date(2024, 1, 1), month_funding(2024, 1, 0.001))
+    archive.add_funding("HOLEUSDT", date(2024, 3, 1), month_funding(2024, 3, 0.002))
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 4, 1),
+            client=client,
+            asof=day_ms(date(2024, 4, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 4, 1))
+    )
+    reasons = {failure.symbol: failure.reason for failure in summary.failures}
+
+    assert summary.bars_written == 0
+    assert frame.empty
+    assert "HOLEUSDT" not in set(frame["symbol"].unique()) if not frame.empty else True
+    assert "HOLEUSDT" in reasons
+    assert "gap" in reasons["HOLEUSDT"]
+
+
+def test_interior_unfunded_month_is_not_treated_as_trailing_lag(
+    tmp_path: Path,
+) -> None:
+    """Klines continue past a funding hole; last funded bar is after the hole."""
+    archive, client = spot_archive(tmp_path)
+    for month in (1, 2, 3):
+        archive.add_monthly_klines("perp", "MIDGAPUSDT", "1d", 2024, month)
+    archive.add_funding("MIDGAPUSDT", date(2024, 1, 1), month_funding(2024, 1, 0.001))
+    archive.add_funding("MIDGAPUSDT", date(2024, 3, 1), month_funding(2024, 3, 0.002))
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 4, 1),
+            client=client,
+            asof=day_ms(date(2024, 4, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 4, 1))
+    )
+
+    assert summary.bars_written == 0
+    assert frame.empty
+    assert [failure.symbol for failure in summary.failures] == ["MIDGAPUSDT"]
+    assert "gap" in summary.failures[0].reason
+
+
+def test_delisted_perp_with_complete_history_writes_and_validates(
+    tmp_path: Path,
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("perp", "DEADUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("perp", "DEADUSDT", "1d", 2024, 2)
+    archive.add_funding("DEADUSDT", date(2024, 1, 1), month_funding(2024, 1, 0.001))
+    archive.add_funding("DEADUSDT", date(2024, 2, 1), month_funding(2024, 2, 0.002))
+    asof = day_ms(date(2024, 4, 2))
+    listing = Listing(
+        symbol="DEADUSDT",
+        exchange="binance",
+        market_type="perp",
+        listed_at=datetime(2024, 1, 1, tzinfo=UTC),
+        delisted_at=datetime(2024, 3, 1, tzinfo=UTC),
+        delist_reason="delisted",
+    )
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 4, 1),
+            client=client,
+            asof=asof,
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(timeframe="1d", query_ts=asof)
+
+    assert summary.failures == ()
+    assert summary.symbols_with_data == 1
+    assert summary.bars_written == 31 + 29
+    assert int(frame["ts"].min()) == day_ms(date(2024, 1, 1))
+    assert int(frame["ts"].max()) == day_ms(date(2024, 2, 29))
+    assert bool(frame["in_universe"].all())
+    assert frame["funding_8h"].notna().all()
+    validate_frame(frame, listings=[listing], timeframe="1d")
+
+
+def test_resume_skips_a_perp_whose_unfunded_tail_was_already_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, client = _live_perp_with_trailing_unfunded_month(tmp_path)
+    store_root = tmp_path / "store"
+    fetches: list[str] = []
+    original_frame = ingest_store._symbol_frame
+
+    def fetch(
+        client: BinanceArchiveClient,
+        coverage: SymbolCoverage,
+        **kwargs: object,
+    ) -> pd.DataFrame:
+        fetches.append(coverage.symbol)
+        return original_frame(client, coverage, **kwargs)
+
+    monkeypatch.setattr(ingest_store, "_symbol_frame", fetch)
+
+    with client:
+        first = ingest_to_store(
+            store_root,
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=day_ms(date(2024, 3, 1)),
+        )
+        downloads_after_first = len(archive.downloads)
+        fetches.clear()
+        second = ingest_to_store(
+            store_root,
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=day_ms(date(2024, 3, 2)),
+        )
+
+    frame = ParquetStore(store_root).read(
+        timeframe="1d", query_ts=day_ms(date(2024, 3, 2))
+    )
+
+    assert first.bars_written == 31
+    assert second.bars_written == 0
+    assert second.files_written == ()
+    assert fetches == []
+    assert len(archive.downloads) == downloads_after_first
+    assert int(frame["ts"].max()) == day_ms(date(2024, 1, 31))
+    assert not frame.duplicated(["ts", "symbol", "market_type"]).any()
+

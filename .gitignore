@@ -22,3 +22,37 @@
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
 replay_pid*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+
+# Generated market data and research output
+/data/
+*.parquet
+*.arrow
+*.feather
+reports/archive-gate-*.json
+research/log/*
+!research/log/.gitkeep
+
+# Paper-trading ledgers
+paper-ledgers/
+paper_ledger*
+paper-ledger*

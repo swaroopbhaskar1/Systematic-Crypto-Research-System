@@ -1,0 +1,1 @@
+"""Thin operational script namespace."""
