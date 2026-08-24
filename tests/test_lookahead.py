@@ -58,7 +58,10 @@ def _panel_from_returns(returns: np.ndarray) -> Panel:
             "market_type": "spot",
             "open": open_,
             "close": close,
-            "quote_volume": 1_000_000_000.0,
+            # The cheating control compounds to enormous synthetic notionals.
+            # Keep execution capacity nonbinding so this fixture isolates
+            # future leakage rather than participation-cap behavior.
+            "quote_volume": 1e100,
             "adv": 1_000_000_000.0,
             "volatility": 0.01,
             "liquidity_decile": 10,
@@ -136,6 +139,12 @@ def _result_frame(result: object, name: str) -> pd.DataFrame:
 def _result_series(result: object, name: str) -> pd.Series:
     value = getattr(result, name)
     assert isinstance(value, pd.Series), f"result.{name} must be a Series"
+    return value
+
+
+def _result_float(result: object, name: str) -> float:
+    value = getattr(result, name)
+    assert isinstance(value, float), f"result.{name} must be a float"
     return value
 
 
@@ -225,7 +234,7 @@ def test_honest_engine_outputs_are_future_extension_invariant() -> None:
     extended_result = _run_backtest(extended, signal)
     end = (HISTORY_BARS - 1) * DAY_MS
 
-    for name in ("equity", "gross_equity", "net_returns", "gross_returns"):
+    for name in ("equity", "gross_equity", "cash", "net_returns", "gross_returns"):
         expected = _result_series(historical_result, name)
         actual = _through_timestamp(_result_series(extended_result, name), end)
         pd.testing.assert_series_equal(actual, expected, check_exact=True)
@@ -315,6 +324,7 @@ def test_cheating_signal_earns_impossible_returns_on_seeded_iid_noise() -> None:
     gross_returns = _result_series(result, "gross_returns")
     observed = gross_returns.dropna()
 
+    assert _result_float(result, "pct_bars_capped") == 0.0
     assert len(observed) >= NOISE_BARS - 2
     assert (observed.iloc[1:] >= 0.0).all()
     assert observed.iloc[1:].gt(0.0).mean() > 0.999

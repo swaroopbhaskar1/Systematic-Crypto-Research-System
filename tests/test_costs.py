@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from fixtures.signals import ScheduledWeightSignal
+
 from cq.backtest.costs import CostModel
 from cq.backtest.engine import (
     MAX_PARTICIPATION,
@@ -15,8 +17,6 @@ from cq.backtest.engine import (
     fill_price,
     run_backtest,
 )
-from fixtures.signals import ScheduledWeightSignal
-
 from cq.data.panel import Panel
 
 DAY_MS = 86_400_000
@@ -597,16 +597,12 @@ def test_delisting_forces_haircut_liquidation_and_blocks_future_listing() -> Non
     )
     close = panel.field("close")
     weights = pd.DataFrame(
-        [
-            (0.50, 1.00),
-            (0.50, 0.00),
-            (0.00, 0.00),
-            (0.00, 0.00),
-            (0.00, 0.00),
-        ],
+        {
+            "OLDUSDT": [0.50, 0.50, 0.00, 0.00, 0.00],
+            "FUTUREUSDT": [1.00, 0.00, 0.00, 0.00, 0.00],
+        },
         index=close.index,
-        columns=close.columns,
-    )
+    ).loc[:, close.columns]
 
     result = run_backtest(
         panel=panel,
