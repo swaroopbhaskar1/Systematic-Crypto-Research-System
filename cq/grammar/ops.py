@@ -1,6 +1,8 @@
 # pyright: reportUnknownMemberType=false
 """Deterministic evaluation of validated grammar expressions."""
 
+from __future__ import annotations
+
 from typing import TypeAlias, assert_never, cast
 
 import numpy as np
