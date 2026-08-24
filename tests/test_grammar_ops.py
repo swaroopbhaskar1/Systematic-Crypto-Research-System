@@ -5,8 +5,6 @@ from collections.abc import Callable
 import numpy as np
 import pandas as pd
 import pytest
-from cq.grammar.ops import evaluate
-from cq.grammar.parser import parse_expression
 from fixtures.grammar import (
     DAY_MS,
     HISTORY_PERIODS,
@@ -15,6 +13,8 @@ from fixtures.grammar import (
 )
 
 from cq.data.panel import Panel
+from cq.grammar.ops import evaluate
+from cq.grammar.parser import parse_expression
 
 
 @pytest.fixture

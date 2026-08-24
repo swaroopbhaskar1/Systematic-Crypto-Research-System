@@ -148,6 +148,12 @@ def _result_float(result: object, name: str) -> float:
     return value
 
 
+def _result_timedelta(result: object, name: str) -> pd.Timedelta:
+    value = getattr(result, name)
+    assert isinstance(value, pd.Timedelta), f"result.{name} must be a Timedelta"
+    return value
+
+
 def _annualized_sharpe(returns: pd.Series) -> float:
     observed = returns.dropna()
     assert len(observed) >= NOISE_BARS - 2
@@ -250,7 +256,7 @@ def test_numeric_panel_timestamps_define_millisecond_data_span() -> None:
         ConstantWeightSignal(),
     )
 
-    assert getattr(result, "data_span") == pd.Timedelta(days=13)
+    assert _result_timedelta(result, "data_span") == pd.Timedelta(days=13)
 
 
 def test_production_contains_exactly_one_canonical_execution_shift() -> None:
