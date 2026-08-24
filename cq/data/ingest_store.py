@@ -24,6 +24,14 @@ Second, nothing here ever invents a bar or a funding rate.  A day with no
 archive produces no row.  A bar with no funding print carries NaN and leaves
 the universe.  A zero funding rate is a real observation and is preserved as
 zero; imputing zero for "missing" would manufacture carry that never existed.
+
+Trailing bars whose funding month has not been published yet are a different
+case.  Daily klines for the current month exist while the monthly funding
+object does not; those bars are jointly unavailable, not a halt.  They are
+omitted from what is written so the stored series has no listing-to-delisting
+interior hole.  They are never filled, and they are never marked in-universe.
+An unpublished month in the *middle* of a listing is still a real hole and
+still fails the whole symbol.
 """
 
 import argparse
@@ -72,6 +80,7 @@ class SymbolCoverage:
     keys: frozenset[str]
     first_day: date | None
     last_day: date | None
+    last_funding_day: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,16 +125,20 @@ def list_symbol_coverage(
     for period in ("monthly", "daily"):
         prefix = kline_prefix(market_type, symbol, timeframe, period=period)
         keys.update(key for key in client.list_objects(prefix) if key.endswith(".zip"))
+    last_funding_day = (
+        _last_funding_day(client, symbol) if market_type == "perp" else None
+    )
     spans = tuple(
         span for key in sorted(keys) if (span := _archive_span(key)) is not None
     )
     if not spans:
-        return SymbolCoverage(symbol, frozenset(keys), None, None)
+        return SymbolCoverage(symbol, frozenset(keys), None, None, last_funding_day)
     return SymbolCoverage(
         symbol,
         frozenset(keys),
         min(span[0] for span in spans),
         max(span[1] for span in spans),
+        last_funding_day,
     )
 
 
@@ -282,6 +295,23 @@ def aggregate_funding(prints: pd.DataFrame, *, timeframe: str) -> pd.DataFrame:
     )
 
 
+def omit_unpublished_funding_tail(frame: pd.DataFrame) -> pd.DataFrame:
+    """Drop trailing bars after the last finite funding print.
+
+    Interior NaNs stay in the frame so gap validation can still reject a
+    real hole.  Nothing is filled: bars after the last funded timestamp are
+    simply not written.
+    """
+
+    if frame.empty:
+        return frame
+    funded = frame["funding_8h"].notna()
+    if not bool(funded.any()):
+        return frame
+    last_funded_ts = int(frame.loc[funded, "ts"].max())
+    return frame.loc[frame["ts"] <= last_funded_ts].reset_index(drop=True)
+
+
 def membership_mask(
     frame: pd.DataFrame, registry: UniverseRegistry, market_type: MarketType
 ) -> "pd.Series[bool]":
@@ -346,6 +376,11 @@ def ingest_to_store(
     Parquet is written per symbol, immediately after validation, so a crash
     loses at most the current symbol.  A later run skips any symbol whose
     requested range is already fully present on disk.
+
+    For perps, the written range is capped at the last bar with finite
+    funding.  Trailing daily klines whose monthly funding object is not yet
+    published are omitted rather than stored as out-of-universe bars inside
+    an open listing.  An interior hole still fails the whole symbol.
     """
 
     _validate_request(market_type, timeframe, start, end, limit)
@@ -398,6 +433,10 @@ def ingest_to_store(
                 )
                 if raw.empty:
                     continue
+                if market_type == "perp":
+                    raw = omit_unpublished_funding_tail(raw)
+                    if raw.empty:
+                        continue
                 frame = _finalize(raw, registry, market_type, resolved_asof)
                 validate_frame(
                     frame,
@@ -691,6 +730,8 @@ def _expected_range_timestamps(
         return frozenset()
     first = max(start, coverage.first_day)
     last = min(end - timedelta(days=1), coverage.last_day)
+    if coverage.last_funding_day is not None:
+        last = min(last, coverage.last_funding_day)
     if last < first:
         return frozenset()
     interval = _interval_ms(timeframe)
@@ -772,6 +813,18 @@ def _archive_span(key: str) -> tuple[date, date] | None:
         return None
     year, month = int(monthly.group(1)), int(monthly.group(2))
     return date(year, month, 1), date(year, month, monthrange(year, month)[1])
+
+
+def _last_funding_day(client: BinanceArchiveClient, symbol: str) -> date | None:
+    last: date | None = None
+    for key in client.list_objects(funding_prefix(symbol)):
+        if not key.endswith(".zip"):
+            continue
+        span = _archive_span(key)
+        if span is None:
+            continue
+        last = span[1] if last is None else max(last, span[1])
+    return last
 
 
 def _overlaps(span: tuple[date, date], since_ms: int, until_ms: int) -> bool:

@@ -1868,3 +1868,252 @@ def test_perp_funding_hole_fails_the_symbol_rather_than_writing_an_untradable_ga
     assert frame.empty
     assert "PERPUSDT" in reasons
     assert "gap" in reasons["PERPUSDT"]
+
+
+# --------------------------------------------------------------------------
+# Trailing unpublished funding is omitted; interior holes still fail
+# --------------------------------------------------------------------------
+
+
+def month_funding(year: int, month: int, rate: float) -> dict[int, float]:
+    prints: dict[int, float] = {}
+    for day in month_days(year, month):
+        prints.update(eight_hourly(day, (rate, rate, rate)))
+    return prints
+
+
+def _live_perp_with_trailing_unfunded_month(
+    tmp_path: Path,
+) -> tuple[FakeArchive, BinanceArchiveClient]:
+    """January is jointly available; February klines exist but funding is unpublished."""
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("perp", "LIVEUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("perp", "LIVEUSDT", "1d", 2024, 2)
+    archive.add_funding("LIVEUSDT", date(2024, 1, 1), month_funding(2024, 1, 0.001))
+    return archive, client
+
+
+def test_live_perp_omits_trailing_unfunded_month_and_validates(
+    tmp_path: Path,
+) -> None:
+    """August-style lag: klines exist, monthly funding does not. Omit the tail."""
+    _, client = _live_perp_with_trailing_unfunded_month(tmp_path)
+    asof = day_ms(date(2024, 3, 1))
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=asof,
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(timeframe="1d", query_ts=asof)
+    in_universe = frame.loc[frame["in_universe"]]
+
+    assert summary.failures == ()
+    assert summary.symbols_with_data == 1
+    assert summary.bars_written == 31
+    assert int(frame["ts"].max()) == day_ms(date(2024, 1, 31))
+    assert day_ms(date(2024, 2, 1)) not in frame["ts"].tolist()
+    assert in_universe["funding_8h"].notna().all()
+    assert bool(in_universe["in_universe"].all())
+    validate_frame(
+        frame,
+        listings=[
+            Listing(
+                symbol="LIVEUSDT",
+                exchange="binance",
+                market_type="perp",
+                listed_at=datetime(2024, 1, 1, tzinfo=UTC),
+            )
+        ],
+        timeframe="1d",
+    )
+
+
+def test_trailing_unfunded_month_is_omitted_not_imputed(tmp_path: Path) -> None:
+    """Zero / ffill / bfill of unpublished funding would materialize February."""
+    _, client = _live_perp_with_trailing_unfunded_month(tmp_path)
+    asof = day_ms(date(2024, 3, 1))
+
+    with client:
+        ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=asof,
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(timeframe="1d", query_ts=asof)
+    february = [
+        day_ms(day) for day in days_between(date(2024, 2, 1), date(2024, 2, 29))
+    ]
+
+    assert not set(february).intersection(frame["ts"].tolist())
+    assert frame["funding_8h"].tolist() == pytest.approx([0.001] * 31)
+    assert not bool((frame["funding_8h"] == 0.0).any())
+    assert frame["funding_8h"].notna().all()
+
+
+def test_interior_missing_month_still_drops_the_whole_perp(tmp_path: Path) -> None:
+    """A hole inside listing→delisting is not a publication lag; write nothing."""
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("perp", "HOLEUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("perp", "HOLEUSDT", "1d", 2024, 3)
+    archive.add_funding("HOLEUSDT", date(2024, 1, 1), month_funding(2024, 1, 0.001))
+    archive.add_funding("HOLEUSDT", date(2024, 3, 1), month_funding(2024, 3, 0.002))
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 4, 1),
+            client=client,
+            asof=day_ms(date(2024, 4, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 4, 1))
+    )
+    reasons = {failure.symbol: failure.reason for failure in summary.failures}
+
+    assert summary.bars_written == 0
+    assert frame.empty
+    assert "HOLEUSDT" not in set(frame["symbol"].unique()) if not frame.empty else True
+    assert "HOLEUSDT" in reasons
+    assert "gap" in reasons["HOLEUSDT"]
+
+
+def test_interior_unfunded_month_is_not_treated_as_trailing_lag(
+    tmp_path: Path,
+) -> None:
+    """Klines continue past a funding hole; last funded bar is after the hole."""
+    archive, client = spot_archive(tmp_path)
+    for month in (1, 2, 3):
+        archive.add_monthly_klines("perp", "MIDGAPUSDT", "1d", 2024, month)
+    archive.add_funding("MIDGAPUSDT", date(2024, 1, 1), month_funding(2024, 1, 0.001))
+    archive.add_funding("MIDGAPUSDT", date(2024, 3, 1), month_funding(2024, 3, 0.002))
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 4, 1),
+            client=client,
+            asof=day_ms(date(2024, 4, 1)),
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(
+        timeframe="1d", query_ts=day_ms(date(2024, 4, 1))
+    )
+
+    assert summary.bars_written == 0
+    assert frame.empty
+    assert [failure.symbol for failure in summary.failures] == ["MIDGAPUSDT"]
+    assert "gap" in summary.failures[0].reason
+
+
+def test_delisted_perp_with_complete_history_writes_and_validates(
+    tmp_path: Path,
+) -> None:
+    archive, client = spot_archive(tmp_path)
+    archive.add_monthly_klines("perp", "DEADUSDT", "1d", 2024, 1)
+    archive.add_monthly_klines("perp", "DEADUSDT", "1d", 2024, 2)
+    archive.add_funding("DEADUSDT", date(2024, 1, 1), month_funding(2024, 1, 0.001))
+    archive.add_funding("DEADUSDT", date(2024, 2, 1), month_funding(2024, 2, 0.002))
+    asof = day_ms(date(2024, 4, 2))
+    listing = Listing(
+        symbol="DEADUSDT",
+        exchange="binance",
+        market_type="perp",
+        listed_at=datetime(2024, 1, 1, tzinfo=UTC),
+        delisted_at=datetime(2024, 3, 1, tzinfo=UTC),
+        delist_reason="delisted",
+    )
+
+    with client:
+        summary = ingest_to_store(
+            tmp_path / "store",
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 4, 1),
+            client=client,
+            asof=asof,
+        )
+
+    frame = ParquetStore(tmp_path / "store").read(timeframe="1d", query_ts=asof)
+
+    assert summary.failures == ()
+    assert summary.symbols_with_data == 1
+    assert summary.bars_written == 31 + 29
+    assert int(frame["ts"].min()) == day_ms(date(2024, 1, 1))
+    assert int(frame["ts"].max()) == day_ms(date(2024, 2, 29))
+    assert bool(frame["in_universe"].all())
+    assert frame["funding_8h"].notna().all()
+    validate_frame(frame, listings=[listing], timeframe="1d")
+
+
+def test_resume_skips_a_perp_whose_unfunded_tail_was_already_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive, client = _live_perp_with_trailing_unfunded_month(tmp_path)
+    store_root = tmp_path / "store"
+    fetches: list[str] = []
+    original_frame = ingest_store._symbol_frame
+
+    def fetch(
+        client: BinanceArchiveClient,
+        coverage: SymbolCoverage,
+        **kwargs: object,
+    ) -> pd.DataFrame:
+        fetches.append(coverage.symbol)
+        return original_frame(client, coverage, **kwargs)
+
+    monkeypatch.setattr(ingest_store, "_symbol_frame", fetch)
+
+    with client:
+        first = ingest_to_store(
+            store_root,
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=day_ms(date(2024, 3, 1)),
+        )
+        downloads_after_first = len(archive.downloads)
+        fetches.clear()
+        second = ingest_to_store(
+            store_root,
+            market_type="perp",
+            timeframe="1d",
+            start=date(2024, 1, 1),
+            end=date(2024, 3, 1),
+            client=client,
+            asof=day_ms(date(2024, 3, 2)),
+        )
+
+    frame = ParquetStore(store_root).read(
+        timeframe="1d", query_ts=day_ms(date(2024, 3, 2))
+    )
+
+    assert first.bars_written == 31
+    assert second.bars_written == 0
+    assert second.files_written == ()
+    assert fetches == []
+    assert len(archive.downloads) == downloads_after_first
+    assert int(frame["ts"].max()) == day_ms(date(2024, 1, 31))
+    assert not frame.duplicated(["ts", "symbol", "market_type"]).any()
+
