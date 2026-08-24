@@ -12,10 +12,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from numbers import Integral, Real
 
+import numpy as np
 import pandas as pd
 from pandas.api.types import is_bool_dtype, is_numeric_dtype
 
 ANNUALIZATION_DAYS = 365
+
+REGIME_CRASH = "crash"
+REGIME_HIGH_VOL = "high_vol"
+REGIME_TRENDING = "trending"
+REGIME_LOW_VOL = "low_vol"
 
 
 @dataclass(frozen=True)
@@ -260,6 +266,216 @@ def gross_net_returns(
         net=net,
         cost_drag_percent=cost_drag_percent(gross, net),
     )
+
+
+def compounded_return(returns: Iterable[float]) -> float:
+    """Return the geometrically compounded total return of a return series.
+
+    Used for subsets of bars, such as one regime, where an equity path is not
+    contiguous and a first-to-last ratio would span bars outside the subset.
+    A return of exactly ``-1.0`` is a total loss and is representable; a
+    return below that is rejected as unreachable without leverage.
+    """
+
+    observed = _finite_values(returns, name="returns", minimum=1)
+    if any(value < -1.0 for value in observed):
+        raise ValueError("a return below -100 percent is not representable")
+    wealth = 1.0
+    for value in observed:
+        wealth *= 1.0 + value
+    return wealth - 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class RegimeConfig:
+    """Thresholds for point-in-time regime tagging.
+
+    Labels are assigned by a fixed priority ladder: ``crash``, then
+    ``high_vol``, then ``trending``, with ``low_vol`` as the documented
+    residual, meaning a bar that is neither crashing nor volatile nor
+    directional.  Every statistic reads a trailing window ending at the bar
+    being labelled, so no label depends on a return that had not happened.
+
+    ``high_volatility`` is an annualized fraction.  ``trend_strength`` is a
+    multiple of the window's expected random walk dispersion, so a value of
+    1.0 means the realized move equals one standard deviation of drift-free
+    noise over the same window.
+    """
+
+    volatility_window: int = 30
+    drawdown_window: int = 90
+    trend_window: int = 30
+    crash_drawdown: float = 0.20
+    high_volatility: float = 1.0
+    trend_strength: float = 1.0
+
+    def __post_init__(self) -> None:
+        _window(self.volatility_window, name="volatility_window")
+        _window(self.drawdown_window, name="drawdown_window")
+        _window(self.trend_window, name="trend_window")
+        _positive_threshold(self.high_volatility, name="high_volatility")
+        _positive_threshold(self.trend_strength, name="trend_strength")
+        _proper_fraction(self.crash_drawdown, name="crash_drawdown")
+
+
+def _window(value: int, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError(f"{name} must be an integer")
+    window = int(value)
+    if window < 2:
+        raise ValueError(f"{name} must span at least 2 bars")
+    return window
+
+
+def _positive_threshold(value: float, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real number")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0.0:
+        raise ValueError(f"{name} must be positive and finite")
+    return number
+
+
+def _proper_fraction(value: float, *, name: str) -> float:
+    number = _positive_threshold(value, name=name)
+    if number >= 1.0:
+        raise ValueError(f"{name} must be below 1.0")
+    return number
+
+
+def market_returns(close: pd.DataFrame, universe: pd.DataFrame) -> pd.Series:
+    """Return the equal-weight cross-sectional mean of in-universe returns.
+
+    A symbol contributes only where it was in the universe on both the prior
+    and the current bar, because a return needs two consecutive observations
+    that actually existed.  Bars where no symbol qualifies are absent from
+    the result rather than imputed as zero.
+    """
+
+    if not close.index.equals(universe.index):
+        raise ValueError("close and universe must share an index")
+    if not close.columns.equals(universe.columns):
+        raise ValueError("close and universe must share columns")
+    if len(close.index) < 2:
+        raise ValueError("market returns require at least two bars")
+    membership = universe.fillna(False).astype(bool)
+    tradable = membership & membership.shift(1, fill_value=False)
+    changes = close.astype(float).pct_change(fill_method=None)
+    average = changes.where(tradable).mean(axis="columns")
+    result = average.loc[average.notna()]
+    result.name = "market_return"
+    return result
+
+
+def classify_regimes(
+    returns: pd.Series,
+    config: RegimeConfig | None = None,
+) -> pd.Series:
+    """Label each bar with the regime knowable at that bar.
+
+    Bars without a full trailing volatility and trend window are absent from
+    the result: no label is imputed, because attributing the warmup to a
+    regime nobody measured would misstate that regime's performance.
+    """
+
+    settings = config if config is not None else RegimeConfig()
+    observed = _regime_returns(returns)
+    start = max(settings.volatility_window, settings.trend_window)
+    if len(observed) < start:
+        raise ValueError("regime classification requires a full trailing window")
+    wealth = _wealth_path(observed)
+    labels = [
+        _regime_label(observed, wealth, position, settings)
+        for position in range(start - 1, len(observed))
+    ]
+    return pd.Series(
+        labels,
+        index=returns.index[start - 1 :],
+        dtype="object",
+        name="regime",
+    )
+
+
+def _regime_returns(returns: pd.Series) -> np.ndarray:
+    if not isinstance(returns.index, pd.Index) or len(returns.index) == 0:
+        raise ValueError("regime classification requires observations")
+    if not returns.index.is_monotonic_increasing:
+        raise ValueError("returns must be ordered by ascending timestamp")
+    values = np.asarray(returns.to_numpy(dtype=float), dtype=float)
+    if not bool(np.isfinite(values).all()):
+        raise ValueError("returns must contain only finite values")
+    if bool((values <= -1.0).any()):
+        raise ValueError("a market return at or below -100 percent is invalid")
+    return values
+
+
+def _wealth_path(observed: np.ndarray) -> np.ndarray:
+    path = np.empty(len(observed) + 1, dtype=float)
+    path[0] = 1.0
+    np.cumprod(1.0 + observed, out=path[1:])
+    return path
+
+
+def _regime_label(
+    observed: np.ndarray,
+    wealth: np.ndarray,
+    position: int,
+    settings: RegimeConfig,
+) -> str:
+    drawdown = _trailing_drawdown(wealth, position, settings.drawdown_window)
+    if drawdown >= settings.crash_drawdown:
+        return REGIME_CRASH
+    volatility = _trailing_volatility(
+        observed,
+        position,
+        settings.volatility_window,
+    )
+    if volatility * math.sqrt(ANNUALIZATION_DAYS) >= settings.high_volatility:
+        return REGIME_HIGH_VOL
+    if _is_trending(observed, position, volatility, settings):
+        return REGIME_TRENDING
+    return REGIME_LOW_VOL
+
+
+def _trailing_window(
+    observed: np.ndarray,
+    position: int,
+    window: int,
+) -> np.ndarray:
+    return observed[position - window + 1 : position + 1]
+
+
+def _trailing_volatility(
+    observed: np.ndarray,
+    position: int,
+    window: int,
+) -> float:
+    return float(np.std(_trailing_window(observed, position, window), ddof=1))
+
+
+def _trailing_drawdown(
+    wealth: np.ndarray,
+    position: int,
+    window: int,
+) -> float:
+    current = position + 1
+    start = max(0, current - window + 1)
+    peak = float(np.max(wealth[start : current + 1]))
+    return 1.0 - float(wealth[current]) / peak
+
+
+def _is_trending(
+    observed: np.ndarray,
+    position: int,
+    volatility: float,
+    settings: RegimeConfig,
+) -> bool:
+    window = settings.trend_window
+    move = math.fsum(float(value) for value in _trailing_window(observed, position, window))
+    expected = volatility * math.sqrt(window)
+    if expected == 0.0:
+        return move != 0.0
+    return abs(move) / expected >= settings.trend_strength
 
 
 def group_values_by_regime(

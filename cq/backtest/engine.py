@@ -5,15 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from numbers import Real
+from numbers import Integral, Real
 from typing import Protocol, TypedDict, cast
 
 import numpy as np
 import pandas as pd
 
 from cq.backtest import costs
+from cq.backtest import metrics as stats
+from cq.backtest.metrics import RegimeConfig
 from cq.data.panel import Panel
 
 MAX_PARTICIPATION = costs.MAX_PARTICIPATION
@@ -24,6 +27,9 @@ executable_notional = costs.executable_notional
 fill_price = costs.fill_price
 
 DEFAULT_DELISTING_HAIRCUT = 0.20
+# Closing quantities are derived by dividing a notional by a price, so a
+# flat position can land a few ulps away from exactly zero.
+_FLAT_TOLERANCE = 1e-12
 DEFAULT_SPREAD_BPS_BY_DECILE = {
     1: 20.0,
     2: 17.5,
@@ -60,13 +66,56 @@ class Signal(Protocol):
 
 
 class BacktestMetrics(TypedDict, total=False):
-    """Metric values populated by the metrics layer."""
+    """Metric values populated by the metrics layer.
 
-    total_return: float
-    annualized_return: float
-    annualized_volatility: float
-    sharpe: float
-    max_drawdown: float
+    Every key is optional because several statistics are genuinely undefined
+    on some equity paths: Sharpe needs nonzero variance, Sortino needs a
+    losing bar, Calmar needs a drawdown, cost drag needs a nonzero gross
+    return, and the trade statistics need a completed round trip.  An
+    undefined statistic is omitted.  Reporting it as ``0.0`` would assert a
+    measurement that was never made.
+
+    Gross and net are reported side by side because the gap between them is
+    the most informative number in the output.
+    """
+
+    gross_return: float
+    net_return: float
+    cost_drag_percent: float
+    gross_sharpe: float
+    net_sharpe: float
+    gross_sortino: float
+    net_sortino: float
+    gross_max_drawdown: float
+    net_max_drawdown: float
+    gross_calmar: float
+    net_calmar: float
+    turnover: float
+    hit_rate: float
+    avg_holding_period_days: float
+    n_round_trips: int
+    n_bars: int
+
+
+@dataclass(frozen=True, slots=True)
+class RoundTrip:
+    """One completed position, opened from flat and closed back to flat."""
+
+    symbol: str
+    entry_timestamp: pd.Timestamp | int
+    exit_timestamp: pd.Timestamp | int
+    return_fraction: float
+
+
+@dataclass(slots=True)
+class _OpenLot:
+    """Average-cost state for a position that has not returned to flat."""
+
+    quantity: float
+    basis: float
+    entry_timestamp: pd.Timestamp | int
+    realized: float
+    closed_basis: float
 
 
 @dataclass(frozen=True)
@@ -194,14 +243,28 @@ def _validate_run_configuration(
         raise ValueError("delisting_haircut must be in [0, 1)")
 
 
-def _validate_weights(weights: pd.DataFrame, expected: pd.DataFrame) -> None:
+def _validate_weights(
+    weights: pd.DataFrame,
+    expected: pd.DataFrame,
+    emission: pd.DataFrame,
+) -> None:
+    """Require finite target weights everywhere the engine can act.
+
+    A non-finite weight on a cell the engine can trade is a signal bug and
+    raises.  Outside the emission mask the value is never read: the grammar
+    compiler deliberately emits NaN for symbols absent from the universe so
+    that "no data" stays distinguishable from "deliberately flat", and the
+    engine cannot hold a position in a symbol it cannot trade.
+    """
+
     if not weights.index.equals(expected.index):
         raise ValueError("signal weights must have the panel index")
     if not weights.columns.equals(expected.columns):
         raise ValueError("signal weights must have the panel columns")
-    values = weights.iloc[1:].to_numpy(dtype=float)
+    actionable = emission.to_numpy(dtype=bool)
+    values = weights.to_numpy(dtype=float)[actionable]
     if not np.isfinite(values).all():
-        raise ValueError("signal weights must be finite")
+        raise ValueError("signal weights must be finite where the engine trades")
 
 
 def _emission_mask(universe: pd.DataFrame) -> pd.DataFrame:
@@ -236,6 +299,7 @@ def _config_hash(
     cost_model: CostModel,
     max_participation: float,
     delisting_haircut: float,
+    regime_config: RegimeConfig,
 ) -> str:
     configuration = {
         "starting_equity": starting_equity,
@@ -245,6 +309,14 @@ def _config_hash(
         "impact_coefficient": cost_model.impact_coefficient,
         "spread_bps_by_decile": {
             decile: cost_model.spread_bps(decile) for decile in range(1, 11)
+        },
+        "regime": {
+            "volatility_window": regime_config.volatility_window,
+            "drawdown_window": regime_config.drawdown_window,
+            "trend_window": regime_config.trend_window,
+            "crash_drawdown": regime_config.crash_drawdown,
+            "high_volatility": regime_config.high_volatility,
+            "trend_strength": regime_config.trend_strength,
         },
     }
     encoded = json.dumps(
@@ -303,6 +375,315 @@ def _trade_record(
     }
 
 
+def _bar_timestamp(value: object) -> pd.Timestamp | int:
+    if isinstance(value, pd.Timestamp):
+        return value
+    if not isinstance(value, bool) and isinstance(value, Integral):
+        return int(value)
+    raise TypeError("bar timestamps must be timestamps or Unix milliseconds")
+
+
+def _record_float(record: Mapping[str, object], key: str) -> float:
+    return _positive_or_negative_float(record[key], key)
+
+
+def _signed_quantity(record: Mapping[str, object]) -> float:
+    quantity = _positive_float(record["quantity"], "quantity")
+    return quantity if record["side"] == Side.BUY.value else -quantity
+
+
+def round_trips(records: Sequence[Mapping[str, object]]) -> tuple[RoundTrip, ...]:
+    """Reconstruct completed round trips from the executed trade records.
+
+    Positions use average-cost accounting and a round trip is recorded only
+    when the position returns to flat, so an open position at the end of the
+    run contributes nothing.  Counting it would report an unrealized mark as
+    a realized outcome.  Execution costs are inside the basis and the
+    proceeds, so the reported return is net.
+    """
+
+    lots: dict[str, _OpenLot] = {}
+    completed: list[RoundTrip] = []
+    for record in records:
+        symbol = str(record["symbol"])
+        delta = _signed_quantity(record)
+        cash_out = delta * _record_float(record, "price") + _record_float(
+            record,
+            "cost",
+        )
+        timestamp = _bar_timestamp(record["timestamp"])
+        lot = lots.get(symbol)
+        if lot is None:
+            lots[symbol] = _OpenLot(delta, cash_out, timestamp, 0.0, 0.0)
+            continue
+        trip = _apply_fill(lots, symbol, lot, delta, cash_out, timestamp)
+        if trip is not None:
+            completed.append(trip)
+    return tuple(completed)
+
+
+def _apply_fill(
+    lots: dict[str, _OpenLot],
+    symbol: str,
+    lot: _OpenLot,
+    delta: float,
+    cash_out: float,
+    timestamp: pd.Timestamp | int,
+) -> RoundTrip | None:
+    if delta * lot.quantity > 0.0:
+        lot.quantity += delta
+        lot.basis += cash_out
+        return None
+    closing = min(abs(delta), abs(lot.quantity))
+    basis_closed = lot.basis * closing / abs(lot.quantity)
+    cash_closed = cash_out * closing / abs(delta)
+    lot.realized += -cash_closed - basis_closed
+    lot.closed_basis += abs(basis_closed)
+    remaining = lot.quantity + delta
+    if abs(remaining) > abs(lot.quantity) * _FLAT_TOLERANCE:
+        lot.quantity = remaining
+        lot.basis -= basis_closed
+        return None
+    del lots[symbol]
+    _reopen(lots, symbol, delta, cash_out, closing, timestamp)
+    return RoundTrip(
+        symbol=symbol,
+        entry_timestamp=lot.entry_timestamp,
+        exit_timestamp=timestamp,
+        return_fraction=lot.realized / lot.closed_basis,
+    )
+
+
+def _reopen(
+    lots: dict[str, _OpenLot],
+    symbol: str,
+    delta: float,
+    cash_out: float,
+    closing: float,
+    timestamp: pd.Timestamp | int,
+) -> None:
+    """Open the leftover of a fill that reversed the position's sign."""
+    leftover = abs(delta) - closing
+    if leftover <= abs(delta) * _FLAT_TOLERANCE:
+        return
+    direction = 1.0 if delta > 0.0 else -1.0
+    share = leftover / abs(delta)
+    lots[symbol] = _OpenLot(
+        direction * leftover,
+        cash_out * share,
+        timestamp,
+        0.0,
+        0.0,
+    )
+
+
+def _optional(compute: Callable[[], float]) -> float | None:
+    """Return the statistic, or ``None`` when it is genuinely undefined.
+
+    Only ``ValueError`` is treated as "undefined"; the metrics layer raises it
+    deliberately for zero variance, zero downside, zero drawdown, and zero
+    gross return.  A ``TypeError`` is a programming error and propagates.
+    """
+
+    try:
+        return compute()
+    except ValueError:
+        return None
+
+
+def _bar_returns(equity: pd.Series) -> tuple[float, ...]:
+    changes = equity.pct_change(fill_method=None).iloc[1:]
+    return tuple(float(value) for value in changes)
+
+
+def _total_return_metrics(
+    gross: tuple[float, ...],
+    net: tuple[float, ...],
+) -> BacktestMetrics:
+    result: BacktestMetrics = {}
+    total_gross = _optional(lambda: stats.gross_return(gross))
+    total_net = _optional(lambda: stats.net_return(net))
+    if total_gross is not None:
+        result["gross_return"] = total_gross
+    if total_net is not None:
+        result["net_return"] = total_net
+    if total_gross is None or total_net is None:
+        return result
+    gross_value, net_value = total_gross, total_net
+    drag = _optional(lambda: stats.cost_drag_percent(gross_value, net_value))
+    if drag is not None:
+        result["cost_drag_percent"] = drag
+    return result
+
+
+def _ratio_metrics(
+    gross_returns: tuple[float, ...],
+    net_returns: tuple[float, ...],
+) -> BacktestMetrics:
+    result: BacktestMetrics = {}
+    gross_sharpe = _optional(lambda: stats.annualized_sharpe(gross_returns))
+    net_sharpe = _optional(lambda: stats.annualized_sharpe(net_returns))
+    gross_sortino = _optional(lambda: stats.annualized_sortino(gross_returns))
+    net_sortino = _optional(lambda: stats.annualized_sortino(net_returns))
+    if gross_sharpe is not None:
+        result["gross_sharpe"] = gross_sharpe
+    if net_sharpe is not None:
+        result["net_sharpe"] = net_sharpe
+    if gross_sortino is not None:
+        result["gross_sortino"] = gross_sortino
+    if net_sortino is not None:
+        result["net_sortino"] = net_sortino
+    return result
+
+
+def _drawdown_metrics(
+    gross: tuple[float, ...],
+    net: tuple[float, ...],
+) -> BacktestMetrics:
+    result: BacktestMetrics = {}
+    gross_drawdown = _optional(lambda: stats.max_drawdown(gross))
+    net_drawdown = _optional(lambda: stats.max_drawdown(net))
+    gross_calmar = _optional(lambda: stats.calmar_ratio(gross))
+    net_calmar = _optional(lambda: stats.calmar_ratio(net))
+    if gross_drawdown is not None:
+        result["gross_max_drawdown"] = gross_drawdown
+    if net_drawdown is not None:
+        result["net_max_drawdown"] = net_drawdown
+    if gross_calmar is not None:
+        result["gross_calmar"] = gross_calmar
+    if net_calmar is not None:
+        result["net_calmar"] = net_calmar
+    return result
+
+
+def _trade_metrics(
+    weights: pd.DataFrame,
+    trips: tuple[RoundTrip, ...],
+) -> BacktestMetrics:
+    result: BacktestMetrics = {"n_round_trips": len(trips)}
+    average = _optional(lambda: stats.turnover(weights))
+    if average is not None:
+        result["turnover"] = average
+    if not trips:
+        return result
+    returns = tuple(trip.return_fraction for trip in trips)
+    wins = _optional(lambda: stats.hit_rate(returns))
+    if wins is not None:
+        result["hit_rate"] = wins
+    holding = _optional(
+        lambda: stats.average_holding_period(
+            tuple(trip.entry_timestamp for trip in trips),
+            tuple(trip.exit_timestamp for trip in trips),
+        )
+    )
+    if holding is not None:
+        result["avg_holding_period_days"] = holding
+    return result
+
+
+def _result_metrics(
+    gross_equity: pd.Series,
+    net_equity: pd.Series,
+    weights: pd.DataFrame,
+    trips: tuple[RoundTrip, ...],
+) -> BacktestMetrics:
+    gross = tuple(float(value) for value in gross_equity)
+    net = tuple(float(value) for value in net_equity)
+    result: BacktestMetrics = {"n_bars": len(net)}
+    result.update(_total_return_metrics(gross, net))
+    result.update(_ratio_metrics(_bar_returns(gross_equity), _bar_returns(net_equity)))
+    result.update(_drawdown_metrics(gross, net))
+    result.update(_trade_metrics(weights, trips))
+    return result
+
+
+def _regime_bucket(
+    gross_values: tuple[float, ...],
+    net_values: tuple[float, ...],
+) -> BacktestMetrics:
+    """Summarize one regime.
+
+    Drawdown and Calmar are deliberately absent: a regime's bars are not
+    contiguous, so a peak-to-trough path across them describes a sequence
+    that never occurred and would understate the real crash drawdown.
+    """
+
+    result: BacktestMetrics = {"n_bars": len(net_values)}
+    result.update(_total_return_metrics_from_bars(gross_values, net_values))
+    result.update(_ratio_metrics(gross_values, net_values))
+    return result
+
+
+def _total_return_metrics_from_bars(
+    gross_values: tuple[float, ...],
+    net_values: tuple[float, ...],
+) -> BacktestMetrics:
+    result: BacktestMetrics = {}
+    total_gross = _optional(lambda: stats.compounded_return(gross_values))
+    total_net = _optional(lambda: stats.compounded_return(net_values))
+    if total_gross is not None:
+        result["gross_return"] = total_gross
+    if total_net is not None:
+        result["net_return"] = total_net
+    if total_gross is None or total_net is None:
+        return result
+    gross_value, net_value = total_gross, total_net
+    drag = _optional(lambda: stats.cost_drag_percent(gross_value, net_value))
+    if drag is not None:
+        result["cost_drag_percent"] = drag
+    return result
+
+
+def _regime_metrics(
+    gross_equity: pd.Series,
+    net_equity: pd.Series,
+    close: pd.DataFrame,
+    universe: pd.DataFrame,
+    config: RegimeConfig,
+) -> dict[str, BacktestMetrics]:
+    """Attribute per-bar performance to the regime knowable at that bar."""
+    labels = _regime_labels(close, universe, config)
+    if labels.empty:
+        return {}
+    gross_bars = gross_equity.pct_change(fill_method=None).loc[labels.index]
+    net_bars = net_equity.pct_change(fill_method=None).loc[labels.index]
+    measurable = gross_bars.notna() & net_bars.notna()
+    if not bool(measurable.any()):
+        return {}
+    gross_groups = stats.group_values_by_regime(
+        gross_bars.loc[measurable],
+        labels.loc[measurable],
+    )
+    net_groups = stats.group_values_by_regime(
+        net_bars.loc[measurable],
+        labels.loc[measurable],
+    )
+    return {
+        label: _regime_bucket(values, net_groups[label])
+        for label, values in gross_groups.items()
+    }
+
+
+def _regime_labels(
+    close: pd.DataFrame,
+    universe: pd.DataFrame,
+    config: RegimeConfig,
+) -> pd.Series:
+    """Classify market regimes, or return nothing when history is too short.
+
+    A short run genuinely has no regime attribution.  Widening the window to
+    manufacture one would label bars using statistics nobody could compute.
+    """
+
+    if len(close.index) < 2:
+        return pd.Series(dtype="object")
+    returns = stats.market_returns(close, universe)
+    needed = max(config.volatility_window, config.trend_window)
+    if len(returns) < needed:
+        return pd.Series(dtype="object")
+    return stats.classify_regimes(returns, config)
+
+
 def run(
     panel: Panel,
     signal: Signal,
@@ -312,6 +693,7 @@ def run(
     max_participation: float = MAX_PARTICIPATION,
     delisting_haircut: float = DEFAULT_DELISTING_HAIRCUT,
     hypothesis_id: str | None = None,
+    regime_config: RegimeConfig | None = None,
 ) -> BacktestResult:
     """Run a target-weight signal with next-open execution."""
     _validate_run_configuration(
@@ -319,17 +701,17 @@ def run(
         max_participation,
         delisting_haircut,
     )
+    regimes = regime_config if regime_config is not None else RegimeConfig()
     model = cost_model if cost_model is not None else _default_cost_model()
     close = panel.field("close")
     if close.empty:
         raise ValueError("panel must contain at least one bar and symbol")
 
     weights = signal.compute(panel).shift(1)
-    _validate_weights(weights, close)
-    weights.iloc[0, :] = 0.0
-
     universe = panel.universe_mask()
-    weights = weights.where(_emission_mask(universe), 0.0)
+    emission = _emission_mask(universe)
+    _validate_weights(weights, close, emission)
+    weights = weights.where(emission, 0.0)
     fields = {
         name: panel.field(name)
         for name in (
@@ -505,8 +887,19 @@ def run(
         positions=positions,
         fills=fills,
         trades=trades,
-        metrics=BacktestMetrics(),
-        regime_metrics={},
+        metrics=_result_metrics(
+            gross_equity,
+            equity,
+            weights,
+            round_trips(trade_records),
+        ),
+        regime_metrics=_regime_metrics(
+            gross_equity,
+            equity,
+            close,
+            universe,
+            regimes,
+        ),
         pct_bars_capped=capped_bars / len(index),
         n_trades=len(trades),
         hypothesis_id=hypothesis_id,
@@ -516,6 +909,7 @@ def run(
             model,
             max_participation,
             delisting_haircut,
+            regimes,
         ),
     )
 
@@ -529,6 +923,7 @@ def run_backtest(
     max_participation: float = MAX_PARTICIPATION,
     delisting_haircut: float = DEFAULT_DELISTING_HAIRCUT,
     hypothesis_id: str | None = None,
+    regime_config: RegimeConfig | None = None,
 ) -> BacktestResult:
     """Compatibility entry point for :func:`run`."""
     return run(
@@ -539,4 +934,5 @@ def run_backtest(
         max_participation=max_participation,
         delisting_haircut=delisting_haircut,
         hypothesis_id=hypothesis_id,
+        regime_config=regime_config,
     )

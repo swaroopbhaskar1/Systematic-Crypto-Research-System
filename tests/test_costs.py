@@ -1,5 +1,6 @@
 import math
 import random
+from dataclasses import fields
 from itertools import pairwise
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import pandas as pd
 import pytest
 from fixtures.signals import ScheduledWeightSignal
 
-from cq.backtest.costs import CostModel
+from cq.backtest.costs import CostBreakdown, CostModel
 from cq.backtest.engine import (
     MAX_PARTICIPATION,
     Bar,
@@ -254,9 +255,10 @@ def test_lower_liquidity_deciles_have_strictly_wider_spreads() -> None:
 def test_from_yaml_parses_actual_market_taker_fees(
     market: str, taker_bps: float
 ) -> None:
-    # costs.yaml intentionally contains only maker/taker fees.  Spread and
-    # impact assumptions are supplied explicitly rather than invented by the
-    # parser.
+    # costs.yaml also declares spread and slippage assumptions, but this
+    # classmethod deliberately reads only the per-market maker/taker fees: its
+    # spread and impact assumptions stay explicit caller inputs.  See
+    # CostConfig.from_yaml for the config-driven path.
     model = CostModel.from_yaml(
         COSTS_CONFIG,
         market_type=market,
@@ -473,6 +475,16 @@ def test_tax_is_excluded_from_trade_costs() -> None:
     assert costs.total_deducted == pytest.approx(
         costs.taker_fee + costs.impact
     )
+
+
+def test_cost_model_carries_no_tax_rate_into_the_trade_loop() -> None:
+    """The configured tax rate must be structurally unreachable from costs."""
+    model = cost_model()
+
+    assert not any("tax" in field.name for field in fields(CostModel))
+    assert not hasattr(model, "tax")
+    assert not hasattr(model, "short_term_rate")
+    assert not any("tax" in field.name for field in fields(CostBreakdown))
 
 
 def test_costs_are_deterministic_for_identical_inputs() -> None:

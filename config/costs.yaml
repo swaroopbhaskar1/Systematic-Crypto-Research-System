@@ -1,4 +1,7 @@
 # Research defaults only. Live execution is intentionally unavailable.
+#
+# Per-market maker/taker fees. Spot and perp fee schedules genuinely differ,
+# so the backtest charges the fee of the market it actually traded.
 costs:
   spot:
     maker_bps: 10
@@ -6,3 +9,24 @@ costs:
   perp:
     maker_bps: 2
     taker_bps: 5
+
+# Spread must vary by liquidity decile. A flat spread assumption is the single
+# most common way small-cap backtests lie. Decile 1 is the least liquid and
+# carries the widest spread; the list is index 0 -> decile 1 and must strictly
+# decrease.
+spread_bps:
+  default: 30
+  by_liquidity_decile: [200, 120, 80, 55, 40, 30, 22, 16, 11, 8]
+
+# Fallback taker fee used when no market type is specified.
+taker_fee_bps: 10
+
+slippage:
+  model: "square_root"
+  coefficient: 0.6      # impact = coef * sigma * sqrt(size/ADV)
+
+# REPORTING ONLY. The tax rate is never read inside the backtest loop and is
+# deliberately absent from CostModel; it exists solely to render an after-tax
+# column alongside gross and net.
+tax:
+  short_term_rate: 0.35   # federal + IL, applied in reporting only

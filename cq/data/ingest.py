@@ -3,7 +3,8 @@
 import io
 import time
 import zipfile
-from collections.abc import Callable, Iterable, Mapping
+from calendar import monthrange
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -76,6 +77,15 @@ class ArchiveObject:
     etag: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class PlannedArchive:
+    """One archive object a range request needs, and the period it covers."""
+
+    key: str
+    period: ArchivePeriod
+    archive_date: date
+
+
 def raw_cache_key(
     exchange: str,
     market_type: MarketType,
@@ -83,16 +93,25 @@ def raw_cache_key(
     timeframe: str,
     archive_date: CacheDate,
     until: datetime | int | None = None,
+    *,
+    period: ArchivePeriod = "daily",
 ) -> Path:
-    """Build a cache path containing every raw-response identity dimension."""
+    """Build a cache path containing every raw-response identity dimension.
+
+    ``period`` participates in the path because a monthly archive and the
+    daily archive for the first of that month describe different byte
+    payloads for the same calendar date; sharing a cache entry would serve
+    one month of bars where one day was requested.
+    """
     _validate_market_and_timeframe(market_type, timeframe)
     day, suffix = _cache_date_and_suffix(archive_date, until)
+    stamp = f"{day:%Y-%m}" if period == "monthly" else day.isoformat()
     return (
         Path(f"exchange={_safe_component(exchange.lower())}")
         / f"market_type={market_type}"
         / f"symbol={_safe_component(symbol)}"
         / f"timeframe={_safe_component(timeframe)}"
-        / f"date={day.isoformat()}{suffix}.zip"
+        / f"date={stamp}{suffix}.zip"
     )
 
 
@@ -359,6 +378,17 @@ def kline_archive_key(
     return f"{prefix}{symbol}-{timeframe}-{archive_date.isoformat()}.zip"
 
 
+def monthly_kline_archive_key(
+    market_type: MarketType,
+    symbol: str,
+    timeframe: str,
+    month: date,
+) -> str:
+    """Build the key of the whole-month archive containing ``month``."""
+    prefix = kline_prefix(market_type, symbol, timeframe, period="monthly")
+    return f"{prefix}{symbol}-{timeframe}-{month:%Y-%m}.zip"
+
+
 def kline_archive_url(
     market_type: MarketType,
     symbol: str,
@@ -374,9 +404,115 @@ def funding_prefix(symbol: str) -> str:
     return f"{archive_root('perp', data_type='funding')}{symbol}/"
 
 
+def funding_archive_key(symbol: str, month: date) -> str:
+    return f"{funding_prefix(symbol)}{symbol}-fundingRate-{month:%Y-%m}.zip"
+
+
 def funding_archive_url(symbol: str, month: date) -> str:
-    key = f"{funding_prefix(symbol)}{symbol}-fundingRate-{month:%Y-%m}.zip"
+    key = funding_archive_key(symbol, month)
     return f"{BINANCE_ARCHIVE_URL}/{quote(key, safe='/')}"
+
+
+def plan_kline_archives(
+    market_type: MarketType,
+    symbol: str,
+    timeframe: str,
+    since_ms: int,
+    until_ms: int,
+) -> tuple[PlannedArchive, ...]:
+    """Cover ``[since_ms, until_ms)`` with the fewest archive objects.
+
+    A calendar month that the request covers end to end is served by its
+    single monthly archive; any partial month at either edge falls back to
+    one archive per day, because Binance publishes a month's archive only
+    after that month has closed.  The two periods never overlap, so the
+    plan reads each bar exactly once.
+    """
+
+    _validate_market_and_timeframe(market_type, timeframe)
+    if until_ms <= since_ms:
+        raise ValueError("until must be later than since")
+    first = datetime.fromtimestamp(since_ms / 1000, tz=UTC).date()
+    last = datetime.fromtimestamp((until_ms - 1) / 1000, tz=UTC).date()
+    planned: list[PlannedArchive] = []
+    cursor = first
+    while cursor <= last:
+        month_start = cursor.replace(day=1)
+        month_end = cursor.replace(day=monthrange(cursor.year, cursor.month)[1])
+        if cursor == month_start and month_end <= last:
+            planned.append(
+                PlannedArchive(
+                    monthly_kline_archive_key(
+                        market_type, symbol, timeframe, month_start
+                    ),
+                    "monthly",
+                    month_start,
+                )
+            )
+            cursor = month_end + timedelta(days=1)
+            continue
+        planned.append(
+            PlannedArchive(
+                kline_archive_key(market_type, symbol, timeframe, cursor),
+                "daily",
+                cursor,
+            )
+        )
+        cursor += timedelta(days=1)
+    return tuple(planned)
+
+
+def fetch_ohlcv_archives(
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+    since: datetime | int,
+    until: datetime | int,
+    market_type: MarketType,
+    *,
+    cache_root: Path = Path("data/raw-cache"),
+    archive_client: "BinanceArchiveClient | None" = None,
+    available_keys: Collection[str] | None = None,
+) -> pd.DataFrame:
+    """Fetch a date range using monthly archives wherever they apply.
+
+    ``available_keys`` restricts the plan to objects an S3 listing has already
+    proven to exist, which is how a delisted symbol stops costing one request
+    per absent month.  Once a key is known to exist, a failure to download it
+    is a real failure and propagates; callers that ingest many symbols catch
+    it and record it rather than losing the symbol silently.
+
+    Unlike :func:`fetch_ohlcv` this does not assert bar contiguity.  A real
+    archive has genuine holes — halts, delistings, symbols that were never
+    published for a day — and the honest response to a hole is an absent row,
+    never an imputed one.
+    """
+
+    _validate_fetch_request(exchange, market_type, timeframe)
+    since_ms, until_ms = _epoch_ms(since), _epoch_ms(until)
+    planned = plan_kline_archives(market_type, symbol, timeframe, since_ms, until_ms)
+    if available_keys is not None:
+        planned = tuple(item for item in planned if item.key in available_keys)
+    owned = archive_client is None
+    client = archive_client or BinanceArchiveClient(cache_root=cache_root)
+    frames: list[pd.DataFrame] = []
+    try:
+        for item in planned:
+            cache_key = raw_cache_key(
+                exchange,
+                market_type,
+                symbol,
+                timeframe,
+                item.archive_date,
+                period=item.period,
+            )
+            frames.append(
+                read_kline_archive(client.download(item.key, cache_key=cache_key))
+            )
+    finally:
+        if owned:
+            client.close()
+    return _merge_archive_frames(frames, since_ms, until_ms)
 
 
 def read_kline_archive(payload: bytes) -> pd.DataFrame:
@@ -445,9 +581,8 @@ def _download_daily_klines(
     return frames
 
 
-def _combine_ohlcv(
+def _merge_archive_frames(
     frames: list[pd.DataFrame],
-    timeframe: str,
     since_ms: int,
     until_ms: int,
 ) -> pd.DataFrame:
@@ -458,8 +593,18 @@ def _combine_ohlcv(
     frame = frame.sort_values("ts").reset_index(drop=True)
     _reject_conflicting_duplicates(frame)
     frame = frame.drop_duplicates("ts", keep="first").reset_index(drop=True)
-    validate_bar_gaps(frame, timeframe=timeframe)
     return frame.loc[:, OHLCV_COLUMNS]
+
+
+def _combine_ohlcv(
+    frames: list[pd.DataFrame],
+    timeframe: str,
+    since_ms: int,
+    until_ms: int,
+) -> pd.DataFrame:
+    frame = _merge_archive_frames(frames, since_ms, until_ms)
+    validate_bar_gaps(frame, timeframe=timeframe)
+    return frame
 
 
 def _reject_conflicting_duplicates(frame: pd.DataFrame) -> None:
