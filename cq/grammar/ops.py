@@ -1,3 +1,4 @@
+# pyright: reportUnknownMemberType=false
 """Deterministic evaluation of validated grammar expressions."""
 
 from typing import TypeAlias, assert_never, cast
@@ -134,7 +135,7 @@ def _rolling(
     source: pd.DataFrame,
     expression: Call,
     panel: Panel,
-) -> Rolling:
+) -> Rolling[pd.DataFrame]:
     window = _integer_argument(expression, panel, 1)
     return source.rolling(window=window, min_periods=window, center=False)
 

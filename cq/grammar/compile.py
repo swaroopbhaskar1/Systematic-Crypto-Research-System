@@ -1,3 +1,4 @@
+# pyright: reportUnknownMemberType=false
 """Compile hypothesis-shaped objects into deterministic target-weight signals."""
 
 from dataclasses import dataclass
@@ -115,7 +116,7 @@ def _validated_data_required(value: object) -> tuple[str, ...]:
     if not isinstance(value, tuple):
         raise GrammarError("data_required must be a tuple of column names")
     columns: list[str] = []
-    for column in value:
+    for column in cast(tuple[object, ...], value):
         if not isinstance(column, str):
             raise GrammarError("data_required must contain only column names")
         columns.append(column)
