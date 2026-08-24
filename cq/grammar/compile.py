@@ -74,8 +74,8 @@ def _target_weights(
 
 
 def _normalize(selected: pd.DataFrame, total: float) -> pd.DataFrame:
-    counts = selected.sum(axis=1)
-    weights = selected.astype(float).div(counts.replace(0, pd.NA), axis=0)
+    counts = selected.sum(axis=1).astype(float)
+    weights = selected.astype(float).div(counts.where(counts > 0), axis=0)
     return weights.mul(total).fillna(0.0)
 
 

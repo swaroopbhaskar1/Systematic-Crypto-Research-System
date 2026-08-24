@@ -70,17 +70,17 @@ def _evaluate_binary(expression: Binary, panel: Panel) -> _Value:
         case BinaryOperator.DIVIDE:
             return left / right
         case BinaryOperator.GREATER:
-            return left > right
+            return _numeric_value(left) > _numeric_value(right)
         case BinaryOperator.GREATER_EQUAL:
-            return left >= right
+            return _numeric_value(left) >= _numeric_value(right)
         case BinaryOperator.LESS:
-            return left < right
+            return _numeric_value(left) < _numeric_value(right)
         case BinaryOperator.LESS_EQUAL:
-            return left <= right
+            return _numeric_value(left) <= _numeric_value(right)
         case BinaryOperator.EQUAL:
-            return left == right
+            return _numeric_value(left) == _numeric_value(right)
         case BinaryOperator.NOT_EQUAL:
-            return left != right
+            return _numeric_value(left) != _numeric_value(right)
         case BinaryOperator.AND:
             return cast(pd.DataFrame, left) & cast(pd.DataFrame, right)
         case BinaryOperator.OR:
@@ -118,9 +118,9 @@ def _evaluate_call(expression: Call, panel: Panel) -> pd.DataFrame:
         case Function.ABS:
             return source.abs()
         case Function.SIGN:
-            return cast(pd.DataFrame, np.sign(source))
+            return cast(pd.DataFrame, np.sign(_numeric_frame(source)))
         case Function.LOG:
-            return cast(pd.DataFrame, np.log(source))
+            return cast(pd.DataFrame, np.log(_numeric_frame(source)))
         case Function.CLIP:
             lower = _number_argument(expression, panel, 1)
             upper = _number_argument(expression, panel, 2)
@@ -149,6 +149,14 @@ def _integer_argument(expression: Call, panel: Panel, index: int) -> int:
     return int(_number_argument(expression, panel, index))
 
 
+def _numeric_value(value: _Value) -> _Value:
+    return _numeric_frame(value) if isinstance(value, pd.DataFrame) else value
+
+
+def _numeric_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    return frame.astype(float)
+
+
 def _xs_rank(source: pd.DataFrame, panel: Panel) -> pd.DataFrame:
     universe = panel.universe_mask()
     eligible = source.where(universe)
@@ -157,7 +165,7 @@ def _xs_rank(source: pd.DataFrame, panel: Panel) -> pd.DataFrame:
 
 def _xs_z(source: pd.DataFrame, panel: Panel) -> pd.DataFrame:
     universe = panel.universe_mask()
-    eligible = source.where(universe)
+    eligible = _numeric_frame(source).where(universe)
     mean = eligible.mean(axis=1)
     standard_deviation = eligible.std(axis=1, ddof=0)
     return eligible.sub(mean, axis=0).div(standard_deviation, axis=0).where(universe)
