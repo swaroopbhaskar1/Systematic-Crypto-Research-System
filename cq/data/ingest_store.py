@@ -4,7 +4,12 @@
 object.  This module is what turns those primitives into a populated
 :class:`~cq.data.store.ParquetStore`: it enumerates symbols, derives
 point-in-time listing bounds, downloads a date range, joins perpetual funding,
-and writes one immutable file per UTC year.
+and writes one immutable file per symbol per UTC year.
+
+A crash can lose at most the symbol currently being fetched.  Each symbol is
+validated, written, and checkpointed before the next download starts, and a
+re-run skips any symbol whose requested ``[start, end)`` range is already
+fully present in the store.
 
 Two decisions here are survivorship-critical and are stated explicitly because
 getting either wrong produces a backtest that looks plausible and is wrong.
@@ -24,10 +29,11 @@ zero; imputing zero for "missing" would manufacture carry that never existed.
 import argparse
 import json
 import re
+import warnings
 from calendar import monthrange
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -43,6 +49,7 @@ from cq.data.ingest import (
 )
 from cq.data.store import REQUIRED_COLUMNS, ParquetStore
 from cq.data.universe import Listing, MarketType, UniverseRegistry
+from cq.data.validate import validate_frame
 
 DAY_MS = 86_400_000
 DEFAULT_CACHE_ROOT = Path("data/archive-cache")
@@ -216,6 +223,11 @@ def resolve_symbols(
     The default enumerates the archive's monthly *and* daily kline roots.
     Neither root filters by current trading status, so a delisted symbol is
     selected exactly like a live one.
+
+    ``limit`` is a debug cap on that sorted name list.  It is not a
+    liquidity ranking and must not be used as one: alphabetical first-N
+    drops BTC/ETH and over-weights names like ``1000BONK``.  Production
+    slices pass an explicit ``symbols`` collection instead.
     """
 
     if limit is not None and limit < 1:
@@ -318,17 +330,22 @@ def ingest_to_store(
     """Ingest ``[start, end)`` for one market type and write it to the store.
 
     ``end`` is exclusive.  Every row of one run carries the same ``asof``, the
-    ingest wall clock in Unix milliseconds, so a later re-ingest lands as a
-    distinguishable revision that a point-in-time read can choose to ignore
-    rather than as a silent overwrite.
+    ingest wall clock in Unix milliseconds.  A later run that still needs to
+    write a symbol uses a new asof so the store can keep the revision;
+    a symbol whose requested range is already complete is skipped instead.
 
-    A symbol that fails — a vanished object, a truncated ZIP, a malformed CSV
-    — is recorded in the returned summary and the run continues, so one bad
-    archive cannot abort a several-hundred-symbol run.  The whole symbol is
-    dropped rather than the failing month, because writing the readable half
-    of a history would leave a hole that looks exactly like a real trading
-    halt.  Nothing is swallowed: the summary is the report, and the CLI turns
-    a non-empty failure list into a non-zero exit status.
+    A symbol that fails — a vanished object, a truncated ZIP, a malformed CSV,
+    or a ``validate_frame`` violation — is recorded in the returned summary and
+    the run continues, so one bad archive cannot abort a several-hundred-symbol
+    run.  The whole symbol is dropped rather than the failing month, because
+    writing the readable half of a history would leave a hole that looks
+    exactly like a real trading halt.  Nothing is swallowed: the summary is
+    the report, and the CLI turns a non-empty failure list into a non-zero
+    exit status.
+
+    Parquet is written per symbol, immediately after validation, so a crash
+    loses at most the current symbol.  A later run skips any symbol whose
+    requested range is already fully present on disk.
     """
 
     _validate_request(market_type, timeframe, start, end, limit)
@@ -341,18 +358,79 @@ def ingest_to_store(
         coverages, failures = _collect_coverages(
             active, market_type, timeframe, selected
         )
-        registry = UniverseRegistry(
-            _listings(coverages, exchange=exchange, market_type=market_type, end=end)
+        listings = _listings(
+            coverages, exchange=exchange, market_type=market_type, end=end
         )
-        frames, fetch_failures = _collect_frames(
-            active,
-            coverages,
-            exchange=exchange,
-            market_type=market_type,
-            timeframe=timeframe,
-            since_ms=since_ms,
-            until_ms=until_ms,
-        )
+        _warn_survivorship(listings)
+        registry = UniverseRegistry(listings)
+        store = ParquetStore(store_root)
+        stored_ts = _stored_timestamps(store, timeframe, market_type, resolved_asof)
+        listing_by_symbol = {item.symbol: item for item in listings}
+        written_paths: list[str] = []
+        fetch_failures: list[SymbolFailure] = []
+        written_symbols: set[str] = set()
+        skipped_symbols: set[str] = set()
+        bars_written = 0
+        first_ts: int | None = None
+        last_ts: int | None = None
+        checkpoint: dict[str, object] = {
+            "market_type": market_type,
+            "timeframe": timeframe,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "symbols": {},
+        }
+        for coverage in coverages:
+            if _range_already_stored(
+                stored_ts.get(coverage.symbol), coverage, start, end, timeframe
+            ):
+                skipped_symbols.add(coverage.symbol)
+                continue
+            try:
+                raw = _symbol_frame(
+                    active,
+                    coverage,
+                    exchange=exchange,
+                    market_type=market_type,
+                    timeframe=timeframe,
+                    since_ms=since_ms,
+                    until_ms=until_ms,
+                )
+                if raw.empty:
+                    continue
+                frame = _finalize(raw, registry, market_type, resolved_asof)
+                validate_frame(
+                    frame,
+                    listings=[
+                        _windowed_listing(
+                            listing_by_symbol[coverage.symbol], start, end
+                        )
+                    ],
+                    timeframe=timeframe,
+                )
+                paths = _write_by_year(store, frame, timeframe)
+            except _SYMBOL_ERRORS as error:
+                fetch_failures.append(SymbolFailure(coverage.symbol, _reason(error)))
+                continue
+            written_paths.extend(paths)
+            written_symbols.add(coverage.symbol)
+            bars_written += len(frame)
+            frame_first = int(frame["ts"].min())
+            frame_last = int(frame["ts"].max())
+            first_ts = frame_first if first_ts is None else min(first_ts, frame_first)
+            last_ts = frame_last if last_ts is None else max(last_ts, frame_last)
+            stored_ts[coverage.symbol] = frozenset(
+                int(value) for value in frame["ts"].astype("int64").tolist()
+            )
+            symbols_payload = checkpoint["symbols"]
+            if not isinstance(symbols_payload, dict):
+                raise TypeError("checkpoint symbols mapping is corrupt")
+            symbols_payload[coverage.symbol] = {
+                "bars": len(frame),
+                "first_ts": frame_first,
+                "last_ts": frame_last,
+            }
+            _write_checkpoint(store_root, checkpoint)
     finally:
         if owned:
             active.close()
@@ -360,22 +438,6 @@ def ingest_to_store(
     all_failures = tuple(
         sorted((*failures, *fetch_failures), key=lambda item: item.symbol)
     )
-    if not frames:
-        return _summary(
-            market_type=market_type,
-            timeframe=timeframe,
-            start=start,
-            end=end,
-            asof=resolved_asof,
-            attempted=len(selected),
-            frame=None,
-            paths=(),
-            failures=all_failures,
-        )
-    frame = _finalize(
-        pd.concat(frames, ignore_index=True), registry, market_type, resolved_asof
-    )
-    paths = _write_by_year(ParquetStore(store_root), frame, timeframe)
     return _summary(
         market_type=market_type,
         timeframe=timeframe,
@@ -383,8 +445,11 @@ def ingest_to_store(
         end=end,
         asof=resolved_asof,
         attempted=len(selected),
-        frame=frame,
-        paths=paths,
+        symbols_with_data=len(written_symbols | skipped_symbols),
+        bars_written=bars_written,
+        first_ts=first_ts,
+        last_ts=last_ts,
+        paths=tuple(written_paths),
         failures=all_failures,
     )
 
@@ -408,7 +473,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="exclusive end date (YYYY-MM-DD)",
     )
     parser.add_argument("--symbols", help="comma-separated symbols; default is all")
-    parser.add_argument("--limit", type=int, help="cap the number of symbols")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="debug cap on sorted archive names; not a liquidity ranking",
+    )
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
     args = parser.parse_args(argv)
 
@@ -446,37 +515,6 @@ def _collect_coverages(
             continue
         coverages.append(coverage)
     return tuple(coverages), tuple(failures)
-
-
-def _collect_frames(
-    client: BinanceArchiveClient,
-    coverages: Sequence[SymbolCoverage],
-    *,
-    exchange: str,
-    market_type: MarketType,
-    timeframe: str,
-    since_ms: int,
-    until_ms: int,
-) -> tuple[tuple[pd.DataFrame, ...], tuple[SymbolFailure, ...]]:
-    frames: list[pd.DataFrame] = []
-    failures: list[SymbolFailure] = []
-    for coverage in coverages:
-        try:
-            frame = _symbol_frame(
-                client,
-                coverage,
-                exchange=exchange,
-                market_type=market_type,
-                timeframe=timeframe,
-                since_ms=since_ms,
-                until_ms=until_ms,
-            )
-        except _SYMBOL_ERRORS as error:
-            failures.append(SymbolFailure(coverage.symbol, _reason(error)))
-            continue
-        if not frame.empty:
-            frames.append(frame)
-    return tuple(frames), tuple(failures)
 
 
 def _symbol_frame(
@@ -581,25 +619,13 @@ def _summary(
     end: date,
     asof: int,
     attempted: int,
-    frame: pd.DataFrame | None,
+    symbols_with_data: int,
+    bars_written: int,
+    first_ts: int | None,
+    last_ts: int | None,
     paths: tuple[str, ...],
     failures: tuple[SymbolFailure, ...],
 ) -> IngestSummary:
-    if frame is None or frame.empty:
-        return IngestSummary(
-            market_type=market_type,
-            timeframe=timeframe,
-            start=start,
-            end=end,
-            asof=asof,
-            symbols_attempted=attempted,
-            symbols_with_data=0,
-            bars_written=0,
-            first_ts=None,
-            last_ts=None,
-            files_written=paths,
-            failures=failures,
-        )
     return IngestSummary(
         market_type=market_type,
         timeframe=timeframe,
@@ -607,13 +633,116 @@ def _summary(
         end=end,
         asof=asof,
         symbols_attempted=attempted,
-        symbols_with_data=int(frame["symbol"].nunique()),
-        bars_written=len(frame),
-        first_ts=int(frame["ts"].min()),
-        last_ts=int(frame["ts"].max()),
+        symbols_with_data=symbols_with_data,
+        bars_written=bars_written,
+        first_ts=first_ts,
+        last_ts=last_ts,
         files_written=paths,
         failures=failures,
     )
+
+
+def _windowed_listing(listing: Listing, start: date, end: date) -> Listing:
+    """Clip listing bounds to the ingest window so pre-window history is not a gap."""
+    window_start = _midnight(start)
+    window_end = _midnight(end)
+    listed_at = max(listing.listed_at, window_start)
+    if listing.delisted_at is None or listing.delisted_at >= window_end:
+        return Listing(
+            symbol=listing.symbol,
+            exchange=listing.exchange,
+            market_type=listing.market_type,
+            listed_at=listed_at,
+        )
+    return Listing(
+        symbol=listing.symbol,
+        exchange=listing.exchange,
+        market_type=listing.market_type,
+        listed_at=listed_at,
+        delisted_at=listing.delisted_at,
+        delist_reason=listing.delist_reason,
+        successor=listing.successor,
+    )
+
+
+def _stored_timestamps(
+    store: ParquetStore,
+    timeframe: str,
+    market_type: MarketType,
+    query_ts: int,
+) -> dict[str, frozenset[int]]:
+    frame = store.read(timeframe=timeframe, query_ts=query_ts)
+    if frame.empty:
+        return {}
+    matched = frame.loc[frame["market_type"] == market_type]
+    return {
+        str(symbol): frozenset(int(value) for value in group["ts"].astype("int64").tolist())
+        for symbol, group in matched.groupby("symbol", sort=False)
+    }
+
+
+def _expected_range_timestamps(
+    coverage: SymbolCoverage,
+    start: date,
+    end: date,
+    timeframe: str,
+) -> frozenset[int]:
+    if coverage.first_day is None or coverage.last_day is None:
+        return frozenset()
+    first = max(start, coverage.first_day)
+    last = min(end - timedelta(days=1), coverage.last_day)
+    if last < first:
+        return frozenset()
+    interval = _interval_ms(timeframe)
+    begin = _ceil_to_interval(_midnight_ms(first), interval)
+    last_ts = _floor_to_interval(_midnight_ms(last) + DAY_MS - 1, interval)
+    if last_ts < begin:
+        return frozenset()
+    return frozenset(range(begin, last_ts + 1, interval))
+
+
+def _range_already_stored(
+    stored: frozenset[int] | None,
+    coverage: SymbolCoverage,
+    start: date,
+    end: date,
+    timeframe: str,
+) -> bool:
+    expected = _expected_range_timestamps(coverage, start, end, timeframe)
+    if not expected or stored is None:
+        return False
+    return expected.issubset(stored)
+
+
+def _ceil_to_interval(value: int, interval: int) -> int:
+    return ((value + interval - 1) // interval) * interval
+
+
+def _floor_to_interval(value: int, interval: int) -> int:
+    return (value // interval) * interval
+
+
+def _warn_survivorship(listings: Sequence[Listing]) -> None:
+    if not listings:
+        return
+    delisted = sum(1 for item in listings if item.delisted_at is not None)
+    live = sum(1 for item in listings if item.delisted_at is None)
+    ratio = float("inf") if not live and delisted else delisted / max(live, 1)
+    if ratio < 0.05:
+        warnings.warn(
+            "survivorship warning: distinct delisted/live ratio "
+            f"is {ratio:.2%}, below 5%",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def _write_checkpoint(store_root: Path, payload: Mapping[str, object]) -> None:
+    path = store_root / ".ingest-checkpoint.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
 
 
 def _validate_request(
