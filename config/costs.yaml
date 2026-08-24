@@ -1,0 +1,8 @@
+# Research defaults only. Live execution is intentionally unavailable.
+costs:
+  spot:
+    maker_bps: 10
+    taker_bps: 10
+  perp:
+    maker_bps: 2
+    taker_bps: 5

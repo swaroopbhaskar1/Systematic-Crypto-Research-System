@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "systematic-crypto-research"
+version = "0.1.0"
+description = "Point-in-time-safe systematic crypto research infrastructure"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "pyarrow>=14",
+    "ccxt>=4.2",
+    "pydantic>=2.5",
+    "pytest>=7.4",
+    "pytest-cov",
+    "httpx",
+    "python-dotenv",
+    "rich",
+]
+
+[project.scripts]
+cq-archive-gate = "cq.data.gate:main"
+
+[tool.setuptools.packages.find]
+include = ["cq*"]
+
+[tool.pytest.ini_options]
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "-ra",
+    "--cov=cq.data",
+    "--cov-branch",
+    "--cov-report=term-missing:skip-covered",
+]
+testpaths = ["tests"]
+xfail_strict = true
+
+[tool.coverage.run]
+branch = true
+source = ["cq.data"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+fail_under = 80
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["cq"]
